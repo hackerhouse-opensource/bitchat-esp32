@@ -67,9 +67,9 @@ static const struct bt_data bitchat_ad[] = {
 };
 
 /* Bot identity and state - NOTE: local_identity and current_channel declared earlier */
-static bool privacy_enabled = false;  /* IRC: /privacy on */
+static bool privacy_enabled = false;  /* privacy on */
 static bool encryption_enabled = true;  /* E2EE on by default */
-static bool stealth_mode = true;  /* IRC: /stealth on (monitor without handshake) */
+static bool stealth_mode = true;  /* stealth on (monitor without handshake) */
 static bool bt_debug_enabled = false;  /* Verbose BT logging */
 static bool debug_enabled = false;  /* Noise XX / BitChat packet analysis */
 static bool bt_ready_flag = false;  /* BLE controller ready */
@@ -1248,6 +1248,7 @@ static void dissect_packet(const uint8_t *data, uint16_t length)
 	
 	/* Parse header */
 	uint8_t version = data[0];
+	(void)version;  /* Reserved for future use */
 	uint8_t type = data[1];
 	uint8_t ttl = data[2];
 	
@@ -1518,14 +1519,16 @@ static uint8_t notify_func(struct bt_conn *conn,
 				
 				/* Check if this is a geohash broadcast (NOT a handshake) */
 				if (is_geohash_broadcast(&tlv_msg)) {
-				/* Track peer FIRST so they appear in list command */
-				add_or_update_peer(sender_id, tlv_msg.nickname,
-				                  tlv_msg.has_channel ? tlv_msg.channel : "#bluetooth",
-				                  bt_conn_get_dst(conn),
-				                  tlv_msg.handshake_data,
-				                  NULL,
-				                  true);
-				
+					/* Handle geohash identity broadcast */
+					handle_geohash_broadcast(&tlv_msg, sender_id);
+					
+					/* Track peer FIRST so they appear in list command */
+					add_or_update_peer(sender_id, tlv_msg.nickname,
+					                  tlv_msg.has_channel ? tlv_msg.channel : "#bluetooth",
+					                  bt_conn_get_dst(conn),
+					                  tlv_msg.handshake_data,
+					                  NULL,
+					                  true);
 					
 					/* DO NOT process as Noise handshake - just continue */
 					return BT_GATT_ITER_CONTINUE;
@@ -3769,10 +3772,8 @@ int main(void)
 	}
 	printk("[BLE] Bluetooth ready\n");
 	
-	printk("\n=== bitchat IRC Mode Ready ===\n");
-	printk("Joined: %s as %s\n", current_channel, local_identity.nickname);
-	printk("Mode: +s (stealth), +e (encrypted)\n");
-	printk("\n");
+	printk("\n=== bitchat ===\n");
+	printk("Joined: %s as %s\n\n", current_channel, local_identity.nickname);
 	printk("Available Commands (type 'help' or press Tab for full list):\n");
 	printk("  Core:\n");
 	printk("    status               - Show system status and connections\n");
