@@ -1,6 +1,14 @@
 /* ESP32-C6 bitchat IRC Client
  * Protocol: Noise_XX_25519_ChaChaPoly_SHA256
  * Full mesh P2P messaging over BLE with IRC-style interface
+ * 
+ * PROTOCOL COMPATIBILITY FIXES:
+ * - Added TLV_TEXT (0x05) field parsing for mobile client compatibility
+ * - Fixed message sending to use proper TLV encoding (NICKNAME + CHANNEL + TEXT)
+ * - Implemented gossip protocol for message relaying when stealth mode is off
+ * - Fixed broadcast recipient ID to use bitchat_BROADCAST_ID (0xFFFFFFFFFFFFFFFF)
+ * - Changed message type from DELIVERY_ACK to MESSAGE for standard broadcasts
+ * - Geohash reserved for future Nostr integration (not used in BLE mesh)
  */
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -26,7 +34,7 @@ LOG_MODULE_REGISTER(bitchat, LOG_LEVEL_INF);
 
 /* Forward declarations for globals used by prompt functions */
 static struct bitchat_identity local_identity;
-static char current_channel[32] = "#bluetooth";
+static char current_channel[32] = "#bluetooth";  /* Default BLE mesh channel */
 
 /* Crypto function prototypes */
 extern int bitchat_init_identity(struct bitchat_identity *id, const char *nickname);
@@ -162,6 +170,12 @@ static uint8_t message_queue_tail = 0;  /* Where to read messages */
 static uint8_t message_queue_count = 0; /* Number of queued messages */
 
 /* GPS coordinates for geohash generation */
+/* NOTE: Geohash is used for Nostr-based channels (internet relays), NOT for BLE mesh.
+ * Official BitChat uses geohash to select from ~300 global Nostr relays for location-based
+ * chat rooms (e.g., #dr5rsj7 for city block, #dr5r for city, etc.).
+ * BLE mesh uses direct peer discovery without geohash routing.
+ * Geohash in this implementation is reserved for future Nostr integration.
+ */
 static double gps_latitude = 37.24624;     /* Area 51, Nevada (default example) */
 static double gps_longitude = -115.82334;  /* West = negative */
 
@@ -1200,18 +1214,8 @@ static ssize_t on_message_received(struct bt_conn *conn,
 	if (type == bitchat_PKT_MESSAGE && payload_len > 0 && payload_len < MAX_MESSAGE_LEN) {
 		/* Don't display here - notifications handle all incoming messages
 		 * This handler is for writes TO our characteristic, not FROM peers */
-		/* char msg[MAX_MESSAGE_LEN + 1];
-		memcpy(msg, ptr, payload_len);
-		msg[payload_len] = '\0';
 		
-		char from_str[50];
-		snprintf(from_str, sizeof(from_str), "#mesh (0x%llx)", (unsigned long long)sender_id);
-		display_message(from_str, msg); */
-		
-		/* Mesh rebroadcast if TTL > 0 */
-		if (ttl > 0) {
-			/* TODO: Implement rebroadcast with new format */
-		}
+		/* Gossip/relay is now handled in notify_func for efficiency */
 	} else if (type != bitchat_PKT_MESSAGE) {
 		/* Encrypted or handshake - already logged by notify_func */
 	}
@@ -1326,12 +1330,14 @@ static void dissect_packet(const uint8_t *data, uint16_t length)
 struct tlv_message {
 	char nickname[bitchat_NICKNAME_LEN + 1];
 	char channel[32];
+	char text[MAX_MESSAGE_LEN + 1];
 	const uint8_t *handshake_data;
 	uint8_t handshake_len;
 	uint8_t handshake_type;
 	bool has_nickname;
 	bool has_channel;
 	bool has_handshake;
+	bool has_text;
 };
 
 static void parse_tlv_payload(const uint8_t *payload, uint16_t payload_len, struct tlv_message *msg)
@@ -1385,6 +1391,11 @@ static void parse_tlv_payload(const uint8_t *payload, uint16_t payload_len, stru
 			} else {
 				msg->channel[0] = '\0';
 			}
+		} else if (tlv_type == bitchat_TLV_TEXT && tlv_len > 0 && tlv_len <= MAX_MESSAGE_LEN) {
+			/* Parse text message field */
+			memcpy(msg->text, tlv_ptr + 2, tlv_len);
+			msg->text[tlv_len] = '\0';
+			msg->has_text = true;
 		} else if (tlv_type == bitchat_TLV_NOISE_INIT || 
 		           tlv_type == bitchat_TLV_NOISE_RESP || 
 		           tlv_type == bitchat_TLV_NOISE_FINISH) {
@@ -1485,7 +1496,9 @@ static uint8_t notify_func(struct bt_conn *conn,
 		const uint8_t *ptr = (const uint8_t *)data;
 		
 		/* Parse header (14 bytes) */
+		uint8_t version = ptr[0];
 		uint8_t type = ptr[1];
+		uint8_t ttl = ptr[2];
 		uint8_t flags = ptr[11];
 		uint16_t payload_len_be;
 		memcpy(&payload_len_be, ptr + 12, 2);
@@ -1498,8 +1511,10 @@ static uint8_t notify_func(struct bt_conn *conn,
 		ptr += 8;
 		
 		/* Optional recipient_id */
+		uint64_t recipient_id = 0;
 		if (flags & bitchat_FLAG_HAS_RECIPIENT) {
-			ptr += 8;  /* Skip recipient_id */
+			memcpy(&recipient_id, ptr, 8);
+			ptr += 8;
 		}
 		
 		/* === HANDLE MESSAGE PACKETS (0x01) === */
@@ -1514,6 +1529,28 @@ static uint8_t notify_func(struct bt_conn *conn,
 				/* Store nickname if present */
 				if (tlv_msg.has_nickname) {
 					store_nickname(sender_id, tlv_msg.nickname);
+				}
+				
+				/* === HANDLE TEXT MESSAGES === */
+				/* Mobile clients send text messages as TLV with NICKNAME + CHANNEL + TEXT */
+				if (tlv_msg.has_text && !tlv_msg.has_handshake) {
+					const char *nick = tlv_msg.has_nickname ? tlv_msg.nickname : get_nickname(sender_id);
+					const char *channel = tlv_msg.has_channel ? tlv_msg.channel : current_channel;
+					
+					char from_str[80];
+					if (nick) {
+						snprintf(from_str, sizeof(from_str), "%s 0x%llx (%s)", 
+						         channel, (unsigned long long)sender_id, nick);
+					} else {
+						snprintf(from_str, sizeof(from_str), "%s 0x%llx", 
+						         channel, (unsigned long long)sender_id);
+					}
+					
+					printk("[MSG] %s: %s\n", from_str, tlv_msg.text);
+					display_message(from_str, tlv_msg.text);
+					messages_received++;
+					
+					return BT_GATT_ITER_CONTINUE;
 				}
 				
 				/* Check if this is a geohash broadcast (NOT a handshake) */
@@ -1959,6 +1996,41 @@ static uint8_t notify_func(struct bt_conn *conn,
 					printk("...");
 				}
 				printk("\n");
+			}
+		}
+		
+		/* === GOSSIP PROTOCOL: RELAY TO OTHER PEERS === */
+		/* Relay messages to other connected peers if:
+		 * 1. Not in stealth mode (actively participating in mesh)
+		 * 2. TTL > 0 (message can still hop)
+		 * 3. Is a MESSAGE or ACK/RECEIPT packet (not handshakes)
+		 * 4. Have other connections to relay to
+		 */
+		if (!stealth_mode && ttl > 0 && connection_count > 1 &&
+		    (type == bitchat_PKT_MESSAGE || type == bitchat_PKT_DELIVERY_ACK || type == bitchat_PKT_READ_RECEIPT)) {
+			
+			/* Decrement TTL for relay */
+			uint8_t relay_data[2048];
+			memcpy(relay_data, data, unpadded_len);
+			relay_data[2] = ttl - 1;  /* Decrement TTL at byte offset 2 */
+			
+			/* Relay to all other connections (except source) */
+			int relayed = 0;
+			for (int i = 0; i < connection_count; i++) {
+				if (active_connections[i] && active_connections[i] != conn && connection_ready[i]) {
+					uint16_t handle = remote_handles[i] ? remote_handles[i] : 0x000a;
+					
+					/* Send without response for relay (fire and forget) */
+					int ret = bt_gatt_write_without_response(active_connections[i], handle, 
+					                                         relay_data, unpadded_len, false);
+					if (ret == 0) {
+						relayed++;
+					}
+				}
+			}
+			
+			if (relayed > 0 && debug_enabled) {
+				printk("[GOSSIP] Relayed message to %d peer(s) (TTL now %d)\n", relayed, ttl - 1);
 			}
 		}
 	}
@@ -3238,13 +3310,38 @@ static int cmd_send(const struct shell *sh, size_t argc, char **argv)
 					encrypted++;
 				}
 			} else {
-				/* No session - send as plaintext broadcast (use DELIVERY_ACK type for phone compatibility) */
+				/* No session - send as plaintext broadcast with TLV encoding */
+				/* Build TLV payload: NICKNAME + CHANNEL + TEXT */
+				uint8_t tlv_payload[256];
+				uint8_t *tlv_ptr = tlv_payload;
+				
+				/* Add nickname TLV */
+				*tlv_ptr++ = bitchat_TLV_NICKNAME;
+				*tlv_ptr++ = strlen(local_identity.nickname);
+				memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
+				tlv_ptr += strlen(local_identity.nickname);
+				
+				/* Add channel TLV */
+				*tlv_ptr++ = bitchat_TLV_CHANNEL;
+				*tlv_ptr++ = strlen(current_channel);
+				memcpy(tlv_ptr, current_channel, strlen(current_channel));
+				tlv_ptr += strlen(current_channel);
+				
+				/* Add text TLV */
+				*tlv_ptr++ = bitchat_TLV_TEXT;
+				*tlv_ptr++ = msg_len;
+				memcpy(tlv_ptr, message, msg_len);
+				tlv_ptr += msg_len;
+				
+				uint16_t total_len = tlv_ptr - tlv_payload;
+				
+				/* Create MESSAGE packet with TLV payload */
 				struct bitchat_packet pkt;
-				if (bitchat_create_packet(&pkt, bitchat_PKT_DELIVERY_ACK, bitchat_MAX_TTL,
-				                         (const uint8_t *)message, msg_len) == 0) {
+				if (bitchat_create_packet(&pkt, bitchat_PKT_MESSAGE, bitchat_MAX_TTL,
+				                         tlv_payload, total_len) == 0) {
 					/* Set recipient to broadcast (all peers) */
 					pkt.header.flags |= bitchat_FLAG_HAS_RECIPIENT;
-					pkt.recipient_id = 0xFFFFFFFFFFFFFFFFULL;
+					pkt.recipient_id = bitchat_BROADCAST_ID;
 					
 					if (bitchat_send_packet(active_connections[i], handle, &pkt) == 0) {
 						sent++;
