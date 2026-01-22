@@ -1,0 +1,92 @@
+#include <zephyr/dt-bindings/led/led.h>
+
+/*
+ * Waveshare ESP32-C6-Touch-LCD-1.9 + ATEC608
+ * 
+ * Hardware Configuration:
+ * - WS2812 LEDs: Connected via SPI2 (using bit-banging technique)
+ * - ST7789 LCD:  GPIO4(MOSI), GPIO5(SCK), GPIO6(DC), GPIO7(BL), GPIO14(RST), GPIO20(CS)
+ * - QMI8658 IMU: GPIO8(SCL), GPIO18(SDA)
+ * - ATEC608:     GPIO1(SCL), GPIO2(SDA) - Secure element
+ * - MicroSD:     GPIO4(MOSI), GPIO5(SCK), GPIO19(MISO), GPIO20(CS)
+ * - Boot Button: GPIO9
+ */
+
+/ {
+	aliases {
+		led-strip = &ws2812;
+		sw0 = &boot_button;
+		atec-i2c = &i2c0;
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		boot_button: button_0 {
+			gpios = <&gpio0 9 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Boot Button";
+		};
+	};
+};
+
+/* Enable IEEE 802.15.4 radio */
+&ieee802154 {
+	status = "okay";
+};
+
+&spi2 {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+	pinctrl-0 = <&spim2_default>;
+	pinctrl-names = "default";
+
+	/* WS2812 LEDs via SPI bit-banging on GPIO3 */
+	ws2812: ws2812@0 {
+		compatible = "worldsemi,ws2812-spi";
+		reg = <0>;
+		spi-max-frequency = <6400000>;
+		chain-length = <2>;
+		/* GRB order for WS2812B */
+		color-mapping = <LED_COLOR_ID_GREEN
+				 LED_COLOR_ID_RED
+				 LED_COLOR_ID_BLUE>;
+		spi-one-frame = <0xf0>;
+		spi-zero-frame = <0xc0>;
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+
+	/* ATEC608 Secure Element */
+	atec: atec@50 {
+		compatible = "atmel,atec";
+		reg = <0x50>;
+	};
+};
+
+&pinctrl {
+	spim2_default: spim2_default {
+		group1 {
+			pinmux = <SPIM2_MOSI_GPIO3>;  /* WS2812 data line only */
+			output-high;
+		};
+		group2 {
+			pinmux = <SPIM2_SCLK_GPIO5>;
+			output-low;
+		};
+	};
+
+	i2c0_default: i2c0_default {
+		group1 {
+			pinmux = <I2C0_SDA_GPIO2>,   /* ATEC608 SDA */
+					 <I2C0_SCL_GPIO1>;   /* ATEC608 SCL */
+			bias-pull-up;
+			drive-open-drain;
+			output-high;
+		};
+	};
+};

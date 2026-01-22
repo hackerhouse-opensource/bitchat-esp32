@@ -1,0 +1,56 @@
+/*
+ * Waveshare ESP32-C6 1.9" Display Development Board
+ * Hardware configuration ported from Arduino examples
+ * 
+ * Display: ST7789V 170×320 LCD - DISABLED
+ * 
+ * RGB LED: WS2812 x2 on GPIO3
+ * - Color order: GRB (Green-Red-Blue)
+ * - Driven via SPI bit-banging
+ * 
+ * Button: BOOT on GPIO9
+ */
+
+/ {
+	aliases {
+		sw0 = &boot_button;
+		led-strip = &ws2812;
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		boot_button: button_0 {
+			gpios = <&gpio0 9 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Boot Button";
+		};
+	};
+};
+
+&pinctrl {
+	spim2_ws2812: spim2_ws2812 {
+		group1 {
+			pinmux = <SPIM2_MOSI_GPIO7>,
+				 <SPIM2_SCLK_GPIO6>;
+		};
+	};
+};
+
+/* SPI2 for WS2812 RGB LEDs only */
+&spi2 {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+	pinctrl-0 = <&spim2_ws2812>;
+	pinctrl-names = "default";
+
+	/* WS2812 RGB LEDs - GRB color order */
+	ws2812: ws2812@0 {
+		compatible = "worldsemi,ws2812-spi";
+		reg = <0>;
+		spi-max-frequency = <6400000>;
+		chain-length = <2>;
+		color-mapping = <1 2 3>; /* GREEN=1, RED=2, BLUE=3 */
+		spi-one-frame = <0xf0>;
+		spi-zero-frame = <0xc0>;
+	};
+};

@@ -1,0 +1,5 @@
+board:
+  name: waveshare_esp32c6_147
+  vendor: waveshare
+  socs:
+    - name: esp32c6_wroom_n4

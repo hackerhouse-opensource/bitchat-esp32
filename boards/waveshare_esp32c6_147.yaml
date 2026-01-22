@@ -1,0 +1,14 @@
+identifier: waveshare_esp32c6_147
+name: Waveshare ESP32-C6 1.47inch Display
+type: mcu
+arch: riscv
+toolchain:
+  - zephyr
+  - espressif
+ram: 512
+flash: 8192
+supported:
+  - gpio
+  - uart
+  - spi
+  - display

@@ -1,0 +1,85 @@
+/*
+ * Waveshare ESP32-C6 1.47" Display Development Board
+ * Custom board definition
+ */
+
+/dts-v1/;
+
+#include <espressif/esp32c6/esp32c6_wroom_n4.dtsi>
+#include "waveshare_esp32c6_147-pinctrl.dtsi"
+
+/ {
+	model = "Waveshare ESP32-C6 1.47inch Display";
+	compatible = "waveshare,esp32c6-147";
+
+	chosen {
+		zephyr,sram = &sram0;
+		zephyr,console = &uart0;
+		zephyr,shell-uart = &uart0;
+		zephyr,flash = &flash0;
+		zephyr,code-partition = &slot0_partition;
+	};
+
+	aliases {
+		led0 = &led0;
+		sw0 = &button0;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		led0: led_0 {
+			gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;
+			label = "LED";
+		};
+	};
+
+	buttons {
+		compatible = "gpio-keys";
+		button0: button_0 {
+			gpios = <&gpio0 0 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "BOOT Button";
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+	pinctrl-0 = <&uart0_default>;
+	pinctrl-names = "default";
+};
+
+&spi2 {
+	status = "okay";
+	pinctrl-0 = <&spim2_default>;
+	pinctrl-names = "default";
+	
+	st7789v@0 {
+		compatible = "sitronix,st7789v";
+		reg = <0>;
+		spi-max-frequency = <20000000>;
+		reset-gpios = <&gpio0 23 GPIO_ACTIVE_LOW>;
+		cmd-data-gpios = <&gpio0 22 GPIO_ACTIVE_HIGH>;
+		width = <172>;
+		height = <320>;
+	};
+};
+
+&flash0 {
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		boot_partition: partition@0 {
+			label = "mcuboot";
+			reg = <0x00000000 0x10000>;
+			read-only;
+		};
+
+		slot0_partition: partition@10000 {
+			label = "image-0";
+			reg = <0x00010000 0x1F0000>;
+		};
+	};
+};

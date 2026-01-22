@@ -1,0 +1,10 @@
+# Application-specific Kconfig
+
+# Source Zephyr Kconfig.zephyr (NOT zephyr/Kconfig directly!)
+source "Kconfig.zephyr"
+
+# Application configuration options can go here
+# Example:
+# config COVEKEY_VERSION
+# 	string "Covekey version"
+# 	default "0.4.0"

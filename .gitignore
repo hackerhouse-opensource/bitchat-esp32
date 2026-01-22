@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+.cache/
+
+# West workspace (will be fetched)
+zephyr/
+modules/
+bootloader/
+tools/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Zephyr SDK
+zephyr-sdk-*/
+zephyr-sdk-minimal.7z
+
+# IDE
+.vscode/
+*.code-workspace

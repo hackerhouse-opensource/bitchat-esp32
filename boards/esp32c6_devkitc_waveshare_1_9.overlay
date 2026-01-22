@@ -1,0 +1,21 @@
+/*
+ * Waveshare ESP32-C6 1.9" Display Board
+ * 170x320 ST7789 display, QMI8658 IMU, CST816 touch, WS2812 LED
+ */
+
+/ {
+	aliases {
+	};
+};
+
+&uart0 {
+	status = "okay";
+	current-speed = <115200>;
+};
+
+/* Fix partition node address/reg mismatch */
+&slot0_partition {
+	/* node name and reg must match */
+	reg = <0x00010000 0x200000>;
+	label = "image-0";
+};
