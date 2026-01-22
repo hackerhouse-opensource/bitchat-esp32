@@ -1,14 +1,6 @@
 /* ESP32-C6 bitchat IRC Client
  * Protocol: Noise_XX_25519_ChaChaPoly_SHA256
  * Full mesh P2P messaging over BLE with IRC-style interface
- * 
- * PROTOCOL COMPATIBILITY FIXES:
- * - Added TLV_TEXT (0x05) field parsing for mobile client compatibility
- * - Fixed message sending to use proper TLV encoding (NICKNAME + CHANNEL + TEXT)
- * - Implemented gossip protocol for message relaying when stealth mode is off
- * - Fixed broadcast recipient ID to use bitchat_BROADCAST_ID (0xFFFFFFFFFFFFFFFF)
- * - Changed message type from DELIVERY_ACK to MESSAGE for standard broadcasts
- * - Geohash reserved for future Nostr integration (not used in BLE mesh)
  */
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -170,11 +162,10 @@ static uint8_t message_queue_tail = 0;  /* Where to read messages */
 static uint8_t message_queue_count = 0; /* Number of queued messages */
 
 /* GPS coordinates for geohash generation */
-/* NOTE: Geohash is used for Nostr-based channels (internet relays), NOT for BLE mesh.
- * Official BitChat uses geohash to select from ~300 global Nostr relays for location-based
- * chat rooms (e.g., #dr5rsj7 for city block, #dr5r for city, etc.).
- * BLE mesh uses direct peer discovery without geohash routing.
- * Geohash in this implementation is reserved for future Nostr integration.
+/* Geohash identity channels work over BLE mesh. #bluetooth is the geohash identity
+ * for local Nostr mesh over Bluetooth. Location-based channels like #9qteukk (block ~150m),
+ * #9qteuk (neighborhood ~1.2km), #9qteu (city ~4.9km), #9qte (province ~39km), 
+ * #9q (region ~1250km) use geohash for proximity-based peer discovery and routing.
  */
 static double gps_latitude = 37.24624;     /* Area 51, Nevada (default example) */
 static double gps_longitude = -115.82334;  /* West = negative */
