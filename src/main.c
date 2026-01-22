@@ -1445,16 +1445,15 @@ static void handle_geohash_broadcast(const struct tlv_message *msg, uint64_t sen
 		}
 	}
 	
-	if (debug_enabled) {
-		printk("[RX] Geohash %s from 0x%llx (%s@%s)\n",
-		       msg->handshake_type == bitchat_TLV_NOISE_INIT ? "channel_hash" : "identity",
-		       (unsigned long long)sender_id, msg->nickname, channel);
-		printk("  Hash: ");
-		for (uint8_t i = 0; i < msg->handshake_len && i < 32; i++) {
-			printk("%02x", msg->handshake_data[i]);
-		}
-		printk("\n");
+	/* Always display geohash broadcasts (important peer discovery info) */
+	printk("[RX] Geohash %s from 0x%llx (%s@%s)\n",
+	       msg->handshake_type == bitchat_TLV_NOISE_INIT ? "channel_hash" : "identity",
+	       (unsigned long long)sender_id, msg->nickname, channel);
+	printk("  Hash: ");
+	for (uint8_t i = 0; i < msg->handshake_len && i < 32; i++) {
+		printk("%02x", msg->handshake_data[i]);
 	}
+	printk("\n");
 }
 
 /* Notification callback */
