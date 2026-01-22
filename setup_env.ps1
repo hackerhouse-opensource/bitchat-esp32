@@ -243,7 +243,7 @@ if (-not (Test-Path $espSocInclude)) {
 		
 		# Fetch ESP32-C6 Bluetooth binary blobs
 		Write-Host "Fetching ESP32-C6 Bluetooth blobs..." -ForegroundColor Yellow
-		& $westExe blobs fetch hal_espressif
+		west blobs fetch hal_espressif
 		if ($LASTEXITCODE -eq 0) {
 			Write-Host "  Bluetooth blobs fetched" -ForegroundColor Green
 		} else {
