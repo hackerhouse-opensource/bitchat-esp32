@@ -234,7 +234,7 @@ if (-not (Test-Path $espSocInclude)) {
 		}
 		
 		# Remove problematic zephyr/Kconfig that causes circular dependency
-		$zephyrKconfig = Join-Path $projectRoot "zephyr" "Kconfig"
+		$zephyrKconfig = Join-Path (Join-Path $projectRoot "zephyr") "Kconfig"
 		if (Test-Path $zephyrKconfig) {
 			Write-Host "Removing zephyr/Kconfig to prevent circular dependency..." -ForegroundColor Yellow
 			Remove-Item $zephyrKconfig -Force
