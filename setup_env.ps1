@@ -122,8 +122,18 @@ if (-not (Test-Path $venvPath)) {
 	
 	Write-Host "Installing west..." -ForegroundColor Yellow
 	& "$venvPath\Scripts\pip.exe" install west --quiet
+	
+	Write-Host "Installing requests (required for west blobs)..." -ForegroundColor Yellow
+	& "$venvPath\Scripts\pip.exe" install requests --quiet
 } else {
 	Write-Host "`nStep 3/5: Build venv exists" -ForegroundColor Gray
+	
+	# Ensure requests is installed even if venv already exists
+	$requestsInstalled = Test-Path (Join-Path $venvPath "Lib\site-packages\requests")
+	if (-not $requestsInstalled) {
+		Write-Host "Installing requests (required for west blobs)..." -ForegroundColor Yellow
+		& "$venvPath\Scripts\pip.exe" install requests --quiet
+	}
 }
 
 # Activate venv in current PS session
