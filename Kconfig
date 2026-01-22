@@ -1,10 +1,11 @@
-# Application-specific Kconfig
+# SPDX-License-Identifier: Apache-2.0
 
-# Source Zephyr Kconfig.zephyr (NOT zephyr/Kconfig directly!)
+mainmenu "BitChat ESP32-C6 Application"
+
 source "Kconfig.zephyr"
 
-# Application configuration options can go here
+# Application-specific configuration options can go here
 # Example:
-# config COVEKEY_VERSION
-# 	string "Covekey version"
-# 	default "0.4.0"
+# config BITCHAT_VERSION
+# 	string "BitChat version"
+# 	default "0.1.0"

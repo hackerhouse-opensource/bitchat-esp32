@@ -3,6 +3,7 @@ build/
 .cache/
 
 # West workspace (will be fetched)
+.west/
 zephyr/
 modules/
 bootloader/

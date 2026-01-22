@@ -4,7 +4,6 @@
  */
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/led_strip.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/logging/log.h>
@@ -35,15 +34,6 @@ extern int bitchat_sha256(const uint8_t *data, size_t len, uint8_t *hash);
 
 /* Shell function prototypes */
 extern const struct shell *shell_backend_uart_get_ptr(void);
-
-/* LED Strip */
-#if DT_NODE_EXISTS(DT_ALIAS(led_strip))
-#define LED_STRIP_NODE DT_ALIAS(led_strip)
-#define HAS_LED_STRIP 1
-static const struct device *led_strip = DEVICE_DT_GET(LED_STRIP_NODE);
-#else
-#define HAS_LED_STRIP 0
-#endif
 
 /* ========== BitChat Configuration ========== */
 
@@ -3635,29 +3625,6 @@ SHELL_CMD_REGISTER(keys, &sub_keys, "Key management commands", NULL);
 /* Bluetooth Commands */
 SHELL_CMD_REGISTER(btle, &sub_btle, "Bluetooth LE commands", NULL);
 
-/* ========== LED Effects ========== */
-
-#if HAS_LED_STRIP
-static void update_led_police(uint32_t tick)
-{
-	if (!device_is_ready(led_strip)) {
-		return;
-	}
-	
-	uint8_t phase = (tick / 10) % 4;
-	struct led_rgb colors[2] = {0};
-	
-	/* WS2812 GRB order: r=G, g=R, b=B */
-	if (phase < 2) {
-		colors[0].g = 255;  /* Red */
-		colors[1].b = (phase == 0) ? 50 : 0;
-	} else {
-		colors[1].b = 255;  /* Blue */
-		colors[0].g = (phase == 2) ? 50 : 0;
-	}
-}
-#endif
-
 /* ========== Initialization ========== */
 
 static void bt_ready(int err)
@@ -3752,14 +3719,9 @@ int main(void)
 	psa_status_t psa_status;
 	
 	printk("\n========================================\n");
-	printk("  BitChat-ESP32 - Bluetooth Mesh Chat ESP32\n");
+	printk("  BitChat-ESP32 - Bluetooth Mesh Chat\n");
+	printk("  Seeed Studio XIAO ESP32C6\n");
 	printk("========================================\n\n");
-	
-#if HAS_LED_STRIP
-	if (device_is_ready(led_strip)) {
-		printk("[LED] Strip ready\n");
-	}
-#endif
 	
 	/* Initialize PSA Crypto */
 	printk("[Init] Initializing PSA Crypto...\n");
@@ -3837,15 +3799,9 @@ int main(void)
 	
 	/* Shell prompt configured via CONFIG_SHELL_PROMPT_UART in prj.conf */
 	
-	/* Main loop */
-	uint32_t tick = 0;
+	/* Main loop - minimal idle loop, shell handles all interaction */
 	while (1) {
-#if HAS_LED_STRIP
-		update_led_police(tick);
-#endif
-		
-		tick++;
-		k_msleep(20);
+		k_msleep(1000);
 	}
 	
 	return 0;

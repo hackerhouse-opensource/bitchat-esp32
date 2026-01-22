@@ -38,7 +38,7 @@ if "%1"=="" (
     exit /b 1
 )
 
-set "BOARD=esp32c6_devkitc/esp32c6/hpcore"
+set "BOARD=esp32c6_devkitc/esp32c6"
 
 if "%1"=="clean" (
     echo Cleaning build directory...

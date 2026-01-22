@@ -40,46 +40,14 @@ Prepend-Path (Join-Path $zephyrSdk "usr\bin")
 # Ninja
 Prepend-Path $ninjaHome
 
-# --- Step 1: Initialize git submodules (Zephyr source ONLY) ---
-$gitmodulesFile = Join-Path $projectRoot ".gitmodules"
-$zephyrGitDir = Join-Path $zephyrBase ".git"
-
-if ((Test-Path $gitmodulesFile) -and -not (Test-Path $zephyrGitDir)) {
-	Write-Host "`nStep 1/5: Downloading Zephyr submodule..." -ForegroundColor Yellow
-	
-	Push-Location $projectRoot
-	try {
-		# Clean stale refs
-		git rm --cached bootloader/mcuboot -f 2>$null
-		git rm --cached modules -r -f 2>$null
-		git rm --cached tools -r -f 2>$null
-		
-		git submodule sync
-		git submodule update --init --recursive
-		
-		if ($LASTEXITCODE -ne 0) {
-			Write-Host "WARNING: Submodule init failed (stale commit reference)" -ForegroundColor Yellow
-			Write-Host "Attempting manual clone of Zephyr main branch..." -ForegroundColor Yellow
-			
-			# Fallback: manual clone if submodule init fails
-			if (-not (Test-Path $zephyrBase)) {
-				git clone -b main --depth 1 https://github.com/zephyrproject-rtos/zephyr.git zephyr
-				if ($LASTEXITCODE -ne 0) {
-					Write-Host "ERROR: Manual clone also failed!" -ForegroundColor Red
-					Pop-Location
-					return
-				}
-				Write-Host "Zephyr cloned manually (shallow clone of main branch)" -ForegroundColor Green
-			}
-		} else {
-			Write-Host "Zephyr downloaded via submodule" -ForegroundColor Green
-		}
-	} finally {
-		Pop-Location
-	}
-} else {
-	Write-Host "`nStep 1/5: Zephyr submodule OK" -ForegroundColor Gray
+# --- Step 1: Check west.yml manifest ---
+$westManifest = Join-Path $projectRoot "west.yml"
+if (-not (Test-Path $westManifest)) {
+	Write-Host "`nERROR: west.yml manifest not found!" -ForegroundColor Red
+	Write-Host "This project requires a west.yml manifest file" -ForegroundColor Yellow
+	return
 }
+Write-Host "`nStep 1/5: Manifest found (west.yml)" -ForegroundColor Gray
 
 # --- Step 2: Verify/Extract Zephyr SDK ---
 Write-Host "`nStep 2/5: Verifying Zephyr SDK..." -ForegroundColor Yellow
@@ -161,24 +129,19 @@ if (-not (Test-Path $venvPath)) {
 # Activate venv in current PS session
 & "$venvPath\Scripts\Activate.ps1"
 
-# --- Step 4: Initialize West workspace (inside zephyr/) ---
-$westDirCorrect = Join-Path $zephyrBase ".west"
-$westDirWrong = Join-Path $projectRoot ".west"
+# --- Step 4: Initialize West workspace (at project root with local manifest) ---
+$westDir = Join-Path $projectRoot ".west"
 
-# Clean up misplaced workspace if it exists at project root
-if ((Test-Path $westDirWrong) -and ($westDirWrong -ne $westDirCorrect)) {
-	Write-Host "`nRemoving misplaced West workspace from project root..." -ForegroundColor Yellow
-	Remove-Item $westDirWrong -Recurse -Force
-}
-
-if (-not (Test-Path $westDirCorrect)) {
-	Write-Host "`nStep 4/5: Initializing West workspace in zephyr/..." -ForegroundColor Yellow
-	Push-Location $zephyrBase
+if (-not (Test-Path $westDir)) {
+	Write-Host "`nStep 4/5: Initializing West workspace locally..." -ForegroundColor Yellow
+	Push-Location $projectRoot
 	try {
 		# CRITICAL: Unset ZEPHYR_BASE during west init
 		$savedZephyrBase = $env:ZEPHYR_BASE
 		$env:ZEPHYR_BASE = $null
 		
+		# Use -l . to specify this directory contains the manifest
+		# This makes west treat the CURRENT directory as the workspace root
 		west init -l .
 		if ($LASTEXITCODE -ne 0) {
 			Write-Host "ERROR: west init failed!" -ForegroundColor Red
@@ -191,36 +154,12 @@ if (-not (Test-Path $westDirCorrect)) {
 		# Restore ZEPHYR_BASE after successful init
 		$env:ZEPHYR_BASE = $savedZephyrBase
 		
-		Write-Host "West workspace initialized in zephyr/" -ForegroundColor Green
+		Write-Host "West workspace initialized locally in project root" -ForegroundColor Green
 	} finally {
 		Pop-Location
 	}
 } else {
-	Write-Host "`nStep 4/5: West workspace OK (in zephyr/.west/)" -ForegroundColor Gray
-	
-	# Verify West config
-	Push-Location $zephyrBase
-	try {
-		# Check if west build is available
-		$westHelp = & west help 2>&1 | Out-String
-		if ($westHelp -notlike "*build*") {
-			Write-Host "West build command not found - reinitializing workspace..." -ForegroundColor Yellow
-			Remove-Item $westDirCorrect -Recurse -Force
-			
-			# CRITICAL: Unset ZEPHYR_BASE during west init
-			$savedZephyrBase = $env:ZEPHYR_BASE
-			$env:ZEPHYR_BASE = $null
-			
-			west init -l .
-			
-			# Restore ZEPHYR_BASE
-			$env:ZEPHYR_BASE = $savedZephyrBase
-			
-			Write-Host "West workspace reinitialized in zephyr/" -ForegroundColor Green
-		}
-	} finally {
-		Pop-Location
-	}
+	Write-Host "`nStep 4/5: West workspace OK (local .west/)" -ForegroundColor Gray
 }
 
 # NOW set all environment variables (after West is initialized)
@@ -238,11 +177,53 @@ $espSocInclude = Join-Path $espIdfPath "components\soc\esp32c6\include"
 
 if (-not (Test-Path $espSocInclude)) {
 	Write-Host "`nStep 5/5: Downloading West modules..." -ForegroundColor Yellow
-	Push-Location $zephyrBase
+	Push-Location $projectRoot
 	try {
 		west update
 		if ($LASTEXITCODE -ne 0) {
 			Write-Host "WARNING: west update had errors" -ForegroundColor Yellow
+		}
+		
+		# Check if West created workspace in parent directory (common issue)
+		$parentDir = Split-Path $projectRoot -Parent
+		$parentZephyr = Join-Path $parentDir "zephyr"
+		$parentModules = Join-Path $parentDir "modules"
+		
+		if ((Test-Path $parentZephyr) -or (Test-Path $parentModules)) {
+			Write-Host "Fixing West workspace location..." -ForegroundColor Yellow
+			
+			# Move directories from parent to project root
+			if (Test-Path $parentZephyr) {
+				Move-Item $parentZephyr $projectRoot -Force
+				Write-Host "  Moved zephyr/ to project root" -ForegroundColor Gray
+			}
+			if (Test-Path $parentModules) {
+				Move-Item $parentModules $projectRoot -Force
+				Write-Host "  Moved modules/ to project root" -ForegroundColor Gray
+			}
+			if (Test-Path (Join-Path $parentDir "bootloader")) {
+				Move-Item (Join-Path $parentDir "bootloader") $projectRoot -Force -ErrorAction SilentlyContinue
+				Write-Host "  Moved bootloader/ to project root" -ForegroundColor Gray
+			}
+			if (Test-Path (Join-Path $parentDir "tools")) {
+				Move-Item (Join-Path $parentDir "tools") $projectRoot -Force -ErrorAction SilentlyContinue
+				Write-Host "  Moved tools/ to project root" -ForegroundColor Gray
+			}
+			
+			# Remove parent .west if it exists and create local one
+			$parentWest = Join-Path $parentDir ".west"
+			if (Test-Path $parentWest) {
+				Remove-Item $parentWest -Recurse -Force
+				Write-Host "  Removed parent .west directory" -ForegroundColor Gray
+			}
+			
+			# Create correct .west configuration
+			$westConfigDir = Join-Path $projectRoot ".west"
+			if (-not (Test-Path $westConfigDir)) {
+				New-Item -ItemType Directory -Path $westConfigDir -Force | Out-Null
+			}
+			Set-Content (Join-Path $westConfigDir "config") -Value "[manifest]`npath = .`nfile = west.yml"
+			Write-Host "  Created local .west workspace" -ForegroundColor Green
 		}
 		
 		# Verify ESP-IDF components
