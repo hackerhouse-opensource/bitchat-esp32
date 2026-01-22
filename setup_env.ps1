@@ -232,6 +232,24 @@ if (-not (Test-Path $espSocInclude)) {
 			Write-Host "Expected: modules/hal/espressif/components/soc/esp32c6/include" -ForegroundColor Yellow
 			return
 		}
+		
+		# Remove problematic zephyr/Kconfig that causes circular dependency
+		$zephyrKconfig = Join-Path $projectRoot "zephyr" "Kconfig"
+		if (Test-Path $zephyrKconfig) {
+			Write-Host "Removing zephyr/Kconfig to prevent circular dependency..." -ForegroundColor Yellow
+			Remove-Item $zephyrKconfig -Force
+			Write-Host "  Removed zephyr/Kconfig" -ForegroundColor Green
+		}
+		
+		# Fetch ESP32-C6 Bluetooth binary blobs
+		Write-Host "Fetching ESP32-C6 Bluetooth blobs..." -ForegroundColor Yellow
+		& $westExe blobs fetch hal_espressif
+		if ($LASTEXITCODE -eq 0) {
+			Write-Host "  Bluetooth blobs fetched" -ForegroundColor Green
+		} else {
+			Write-Host "  Warning: Blob fetch had issues (exit code: $LASTEXITCODE)" -ForegroundColor Yellow
+		}
+		
 		Write-Host "West modules downloaded" -ForegroundColor Green
 	} finally {
 		Pop-Location
