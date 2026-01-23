@@ -63,6 +63,8 @@ enum bitchat_packet_type {
 #define bitchat_TLV_TEXT          0x05  /* Plain text message */
 #define bitchat_TLV_ENCRYPTED     0x06  /* Encrypted content */
 #define bitchat_TLV_CHANNEL       0x07  /* Channel name string */
+#define bitchat_TLV_GEOHASH       0x08  /* Geohash identity string (for Nostr peer discovery) */
+#define bitchat_TLV_PUBKEY        0x09  /* Nostr public key (32 bytes, for identity broadcasts) */
 
 /* bitchat packet header (14 bytes fixed - official format) */
 struct bitchat_header {

@@ -24,6 +24,13 @@
 
 LOG_MODULE_REGISTER(bitchat, LOG_LEVEL_INF);
 
+/* Dedicated work queue for BLE operations (separate from system work queue) */
+#define BLE_WORKQ_STACK_SIZE 4096
+#define BLE_WORKQ_PRIORITY 5
+
+static K_THREAD_STACK_DEFINE(ble_workq_stack, BLE_WORKQ_STACK_SIZE);
+static struct k_work_q ble_workq;
+
 /* Forward declarations for globals used by prompt functions */
 static struct bitchat_identity local_identity;
 static char current_channel[32] = "#bluetooth";  /* Default BLE mesh channel */
@@ -97,6 +104,14 @@ struct handshake_work {
 
 static struct handshake_work handshake_works[CONFIG_BT_MAX_CONN];
 
+/* Work structure for sending identity broadcasts */
+struct identity_broadcast_work {
+	struct k_work work;
+	struct bt_conn *conn;
+};
+
+static struct identity_broadcast_work identity_broadcast_works[CONFIG_BT_MAX_CONN];
+
 /* Work queue for debug dissection (offload heavy printing from callback) */
 #define DEBUG_BUFFER_SIZE 2048
 struct debug_work {
@@ -115,6 +130,19 @@ struct tx_debug_work {
 };
 
 static struct tx_debug_work tx_debug_work_item;
+
+/* Work structure for sending messages (must run in ble_workq for GATT writes) */
+#define MAX_SEND_MESSAGE_LEN 256
+struct send_message_work {
+	struct k_work work;
+	struct bt_conn *conn;
+	uint16_t handle;
+	uint8_t message[MAX_SEND_MESSAGE_LEN];
+	uint16_t message_len;
+	bool is_encrypted;
+};
+
+static struct send_message_work send_works[CONFIG_BT_MAX_CONN];
 
 /* Peer tracking - stores discovered peers with keys and nicknames */
 #define PEER_CACHE_SIZE 16
@@ -644,10 +672,13 @@ static int bitchat_send_packet(struct bt_conn *conn, uint16_t handle,
 	}
 	
 	/* Show TX packet dissection if debug enabled (offload to worker thread) */
+	/* Only submit if not already pending to avoid data corruption */
 	if (debug_enabled && padded_size <= DEBUG_BUFFER_SIZE) {
-		memcpy(tx_debug_work_item.packet_data, send_buffer, padded_size);
-		tx_debug_work_item.packet_len = padded_size;
-		k_work_submit(&tx_debug_work_item.work);
+		if (k_work_busy_get(&tx_debug_work_item.work) == 0) {
+			memcpy(tx_debug_work_item.packet_data, send_buffer, padded_size);
+			tx_debug_work_item.packet_len = padded_size;
+			k_work_submit_to_queue(&ble_workq, &tx_debug_work_item.work);
+		}
 	}
 	
 	/* Verify connection is still valid before sending */
@@ -1262,7 +1293,7 @@ static void dissect_packet(const uint8_t *data, uint16_t length)
 		payload_len = length > 22 ? length - 22 : 0;
 	}
 	
-	/* Compact output - all important info on 2 lines */
+	/* Condensed header - single line */
 	const char *type_str = "???";
 	switch (type) {
 	case bitchat_PKT_MESSAGE: type_str = "MSG"; break;
@@ -1273,47 +1304,44 @@ static void dissect_packet(const uint8_t *data, uint16_t length)
 	case bitchat_PKT_FRAGMENT: type_str = "FRAG"; break;
 	}
 	
-	printk("\n[PKT] len=%u type=%s ttl=%u ts=%llu flags=0x%02x payload=%u\n",
+	printk("\n[RX] len=%u type=%s ttl=%u ts=%llu flags=0x%02x payload=%u",
 	       length, type_str, ttl, (unsigned long long)timestamp, flags, payload_len);
 	
-	/* Parse IDs and payload */
+	/* Parse IDs */
 	if (length >= 14 + 8) {
 		uint64_t sender_id;
 		memcpy(&sender_id, data + 14, 8);
-		printk("      sender=0x%016llx", (unsigned long long)sender_id);
-		
-		const uint8_t *payload_ptr = data + 14 + 8;
+		printk(" sender=0x%016llx", (unsigned long long)sender_id);
 		
 		if (flags & bitchat_FLAG_HAS_RECIPIENT && length >= 14 + 8 + 8) {
 			uint64_t recipient_id;
 			memcpy(&recipient_id, data + 14 + 8, 8);
 			printk(" recip=0x%016llx", (unsigned long long)recipient_id);
-			payload_ptr += 8;
 		}
-		printk("\n");
+	}
+	printk("\n");
+	
+	/* Full hexdump -C format of entire packet */
+	for (uint16_t offset = 0; offset < length; offset += 16) {
+		printk("  %04x  ", offset);
 		
-		/* Compact hexdump */
-		if (payload_len > 0) {
-			for (uint16_t offset = 0; offset < payload_len; offset += 16) {
-				printk("      %04x  ", offset);
-				
-				for (uint16_t i = 0; i < 16; i++) {
-					if (offset + i < payload_len) {
-						printk("%02x ", payload_ptr[offset + i]);
-					} else {
-						printk("   ");
-					}
-					if (i == 7) printk(" ");
-				}
-				
-				printk(" |");
-				for (uint16_t i = 0; i < 16 && offset + i < payload_len; i++) {
-					uint8_t c = payload_ptr[offset + i];
-					printk("%c", (c >= 32 && c <= 126) ? c : '.');
-				}
-				printk("|\n");
+		/* Hex bytes (8 + space + 8) */
+		for (uint16_t i = 0; i < 16; i++) {
+			if (offset + i < length) {
+				printk("%02x ", data[offset + i]);
+			} else {
+				printk("   ");
 			}
+			if (i == 7) printk(" ");
 		}
+		
+		/* ASCII representation */
+		printk(" |");
+		for (uint16_t i = 0; i < 16 && offset + i < length; i++) {
+			uint8_t c = data[offset + i];
+			printk("%c", (c >= 32 && c <= 126) ? c : '.');
+		}
+		printk("|\n");
 	}
 }
 
@@ -1476,10 +1504,13 @@ static uint8_t notify_func(struct bt_conn *conn,
 	uint16_t unpadded_len = bitchat_unpad_packet((const uint8_t *)data, length);
 	
 	/* Offload dissection to worker thread if debug enabled (avoid blocking callback) */
+	/* Only submit if not already pending to avoid data corruption */
 	if (debug_enabled && unpadded_len <= DEBUG_BUFFER_SIZE) {
-		memcpy(debug_work_item.packet_data, data, unpadded_len);
-		debug_work_item.packet_len = unpadded_len;
-		k_work_submit(&debug_work_item.work);
+		if (k_work_busy_get(&debug_work_item.work) == 0) {
+			memcpy(debug_work_item.packet_data, data, unpadded_len);
+			debug_work_item.packet_len = unpadded_len;
+			k_work_submit_to_queue(&ble_workq, &debug_work_item.work);
+		}
 	}
 	
 	/* Parse official bitchat packet format */
@@ -2038,30 +2069,195 @@ static void debug_dissect_work_handler(struct k_work *work)
 	dissect_packet(dw->packet_data, dw->packet_len);
 }
 
-/* Work handler for TX debug dissection - runs in system work queue context */
+/* Work handler for TX debug dissection - runs in dedicated BLE work queue */
 static void tx_debug_dissect_work_handler(struct k_work *work)
 {
 	struct tx_debug_work *dw = CONTAINER_OF(work, struct tx_debug_work, work);
 	
-	/* Run TX dissector in worker thread - safe to take time here */
-	printk("\n[TX Dissector] Packet to send:\n");
-	printk("  Total length: %u bytes (padded)\n", dw->packet_len);
-	printk("  Raw data (first 128 bytes):\n");
-	uint16_t show_len = dw->packet_len > 128 ? 128 : dw->packet_len;
-	for (uint16_t i = 0; i < show_len; i += 16) {
-		printk("    %04x  ", i);
-		for (uint16_t j = 0; j < 16 && i + j < show_len; j++) {
-			printk("%02x ", dw->packet_data[i + j]);
+	/* Parse header for condensed output */
+	if (dw->packet_len >= 14) {
+		uint8_t type = dw->packet_data[1];
+		uint8_t ttl = dw->packet_data[2];
+		uint8_t flags = dw->packet_data[11];
+		
+		uint16_t payload_len_be;
+		memcpy(&payload_len_be, dw->packet_data + 12, 2);
+		uint16_t payload_len = sys_be16_to_cpu(payload_len_be);
+		
+		const char *type_str = "???";
+		switch (type) {
+		case bitchat_PKT_MESSAGE: type_str = "MSG"; break;
+		case bitchat_PKT_DELIVERY_ACK: type_str = "ACK"; break;
+		case bitchat_PKT_READ_RECEIPT: type_str = "READ"; break;
+		case bitchat_PKT_NOISE_HANDSHAKE: type_str = "HSHK"; break;
+		case bitchat_PKT_NOISE_ENCRYPTED: type_str = "ENC"; break;
+		case bitchat_PKT_FRAGMENT: type_str = "FRAG"; break;
 		}
+		
+		printk("\n[TX] len=%u type=%s ttl=%u flags=0x%02x payload=%u\n",
+		       dw->packet_len, type_str, ttl, flags, payload_len);
+	} else {
+		printk("\n[TX] len=%u\n", dw->packet_len);
+	}
+	
+	/* Full hexdump -C format of entire packet */
+	for (uint16_t offset = 0; offset < dw->packet_len; offset += 16) {
+		printk("  %04x  ", offset);
+		
+		/* Hex bytes (8 + space + 8) */
+		for (uint16_t i = 0; i < 16; i++) {
+			if (offset + i < dw->packet_len) {
+				printk("%02x ", dw->packet_data[offset + i]);
+			} else {
+				printk("   ");
+			}
+			if (i == 7) printk(" ");
+		}
+		
+		/* ASCII representation */
 		printk(" |");
-		for (uint16_t j = 0; j < 16 && i + j < show_len; j++) {
-			uint8_t c = dw->packet_data[i + j];
-			printk("%c", (c >= 32 && c < 127) ? c : '.');
+		for (uint16_t i = 0; i < 16 && offset + i < dw->packet_len; i++) {
+			uint8_t c = dw->packet_data[offset + i];
+			printk("%c", (c >= 32 && c <= 126) ? c : '.');
 		}
 		printk("|\n");
 	}
-	if (dw->packet_len > 128) printk("    ... (%u more bytes)\n", dw->packet_len - 128);
-	printk("[End TX Dissector]\n\n");
+}
+
+/* Work handler to send messages - runs in dedicated BLE work queue (for safe GATT writes) */
+static void send_message_work_handler(struct k_work *work)
+{
+	struct send_message_work *send_work = CONTAINER_OF(work, struct send_message_work, work);
+	struct bt_conn *conn = send_work->conn;
+	
+	if (!conn) {
+		printk("[Send Work] ERROR: NULL connection\n");
+		return;
+	}
+	
+	if (send_work->is_encrypted) {
+		/* Send encrypted message */
+		if (send_encrypted_message(conn, bitchat_PKT_MESSAGE, (const char *)send_work->message) == 0) {
+			if (debug_enabled) {
+				printk("[Send] Encrypted message sent\n");
+			}
+		}
+	} else {
+		/* Send plaintext message with TLV encoding */
+		uint8_t tlv_payload[256];
+		uint8_t *tlv_ptr = tlv_payload;
+		
+		/* Add nickname TLV */
+		*tlv_ptr++ = bitchat_TLV_NICKNAME;
+		*tlv_ptr++ = strlen(local_identity.nickname);
+		memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
+		tlv_ptr += strlen(local_identity.nickname);
+		
+		/* Add channel TLV */
+		*tlv_ptr++ = bitchat_TLV_CHANNEL;
+		*tlv_ptr++ = strlen(current_channel);
+		memcpy(tlv_ptr, current_channel, strlen(current_channel));
+		tlv_ptr += strlen(current_channel);
+		
+		/* Add text TLV */
+		*tlv_ptr++ = bitchat_TLV_TEXT;
+		*tlv_ptr++ = send_work->message_len;
+		memcpy(tlv_ptr, send_work->message, send_work->message_len);
+		tlv_ptr += send_work->message_len;
+		
+		uint16_t total_len = tlv_ptr - tlv_payload;
+		
+		/* Create MESSAGE packet with TLV payload */
+		struct bitchat_packet pkt;
+		if (bitchat_create_packet(&pkt, bitchat_PKT_MESSAGE, bitchat_MAX_TTL,
+		                         tlv_payload, total_len) == 0) {
+			/* Set recipient to broadcast (all peers) */
+			pkt.header.flags |= bitchat_FLAG_HAS_RECIPIENT;
+			pkt.recipient_id = bitchat_BROADCAST_ID;
+			
+			if (bitchat_send_packet(conn, send_work->handle, &pkt) == 0) {
+				if (debug_enabled) {
+					printk("[Send] Plaintext message sent\n");
+				}
+			}
+		}
+	}
+	
+	/* Release reference taken when submitting work */
+	bt_conn_unref(conn);
+}
+
+/* Work handler to send Nostr geohash identity broadcast - runs in dedicated BLE work queue */
+static void send_identity_broadcast_work_handler(struct k_work *work)
+{
+	struct identity_broadcast_work *id_work = CONTAINER_OF(work, struct identity_broadcast_work, work);
+	struct bt_conn *conn = id_work->conn;
+	
+	if (!conn) {
+		printk("[Work] ERROR: NULL connection in identity broadcast work\n");
+		return;
+	}
+	
+	int conn_idx = get_conn_index(conn);
+	if (conn_idx < 0) {
+		printk("[Work] ERROR: Connection not found\n");
+		bt_conn_unref(conn);
+		return;
+	}
+	
+	/* Build Nostr geohash identity broadcast (TLV format):
+	 * - NICKNAME: User display name
+	 * - CHANNEL: Current channel (e.g., #bluetooth for local mesh)
+	 * - GEOHASH: Location-based identity (7 chars = ~150m precision)
+	 * - PUBKEY: Nostr public key (32-byte Ed25519/X25519 key)
+	 * 
+	 * This is used for proximity-based peer discovery in the mesh network.
+	 * Noise handshakes are ONLY used for privmsg E2EE sessions, NOT for discovery.
+	 */
+	uint8_t tlv_payload[256];
+	uint8_t *tlv_ptr = tlv_payload;
+	
+	/* Add nickname */
+	*tlv_ptr++ = bitchat_TLV_NICKNAME;
+	*tlv_ptr++ = strlen(local_identity.nickname);
+	memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
+	tlv_ptr += strlen(local_identity.nickname);
+	
+	/* Add channel */
+	*tlv_ptr++ = bitchat_TLV_CHANNEL;
+	*tlv_ptr++ = strlen(current_channel);
+	memcpy(tlv_ptr, current_channel, strlen(current_channel));
+	tlv_ptr += strlen(current_channel);
+	
+	/* Add geohash (7 character precision ~150m for proximity-based mesh) */
+	char geohash_str[12];
+	encode_geohash(gps_latitude, gps_longitude, 7, geohash_str);
+	*tlv_ptr++ = bitchat_TLV_GEOHASH;
+	*tlv_ptr++ = strlen(geohash_str);
+	memcpy(tlv_ptr, geohash_str, strlen(geohash_str));
+	tlv_ptr += strlen(geohash_str);
+	
+	/* Add Nostr public key (32 bytes - X25519 static key used as Nostr identity) */
+	*tlv_ptr++ = bitchat_TLV_PUBKEY;
+	*tlv_ptr++ = NOISE_KEY_SIZE;
+	memcpy(tlv_ptr, local_identity.noise_public, NOISE_KEY_SIZE);
+	tlv_ptr += NOISE_KEY_SIZE;
+	
+	uint16_t total_len = tlv_ptr - tlv_payload;
+	
+	/* Send as PKT_MESSAGE (NOT PKT_NOISE_HANDSHAKE - that's only for privmsg E2EE) */
+	int ret = send_handshake_packet(conn, bitchat_PKT_MESSAGE, tlv_payload, total_len);
+	if (ret == 0) {
+		if (debug_enabled) {
+			printk("[Nostr] Sent geohash identity broadcast (geohash: %s, channel: %s)\n",
+			       geohash_str, current_channel);
+		}
+	} else {
+		printk("[Nostr] ERROR: Failed to send identity broadcast (ret=%d)\n", ret);
+	}
+	
+	/* Release reference taken when submitting work */
+	bt_conn_unref(conn);
 }
 
 /* Work handler to send handshake - runs in system work queue context */
@@ -2166,23 +2362,19 @@ printk("[GATT] ERROR: Remote handle not set\n");
 return;
 }
 
-/* Now safe to send handshake - but defer to work queue to avoid calling
+/* Now safe to send identity broadcast - but defer to work queue to avoid calling
  * bt_gatt_write_without_response from within GATT callback context */
 if (!stealth_mode) {
 	if (debug_enabled) {
-		printk("[GATT] Preparing to send handshake INIT to peer...\n");
+		printk("[GATT] Preparing to send Nostr identity broadcast to peer...\n");
 	}
-	if (init_session_for_conn(conn, true) == 0) {
-		/* Submit work to send handshake from system work queue */
-		bt_conn_ref(conn);  /* Take reference for work handler */
-		handshake_works[conn_idx].conn = conn;
-		k_work_submit(&handshake_works[conn_idx].work);
-		
-		/* Try to send any queued messages now that we have a peer */
-		send_queued_messages();
-	} else {
-		printk("[GATT] ERROR: Failed to init session for connection\n");
-	}
+	/* Submit identity broadcast work to BLE work queue (dedicated thread) */
+	bt_conn_ref(conn);  /* Take reference for work handler */
+	identity_broadcast_works[conn_idx].conn = conn;
+	k_work_submit_to_queue(&ble_workq, &identity_broadcast_works[conn_idx].work);
+	
+	/* Try to send any queued messages now that we have a peer */
+	send_queued_messages();
 } else {
 	if (debug_enabled) {
 		printk("[GATT] Stealth mode - listening only\n");
@@ -3278,7 +3470,7 @@ static int cmd_send(const struct shell *sh, size_t argc, char **argv)
 		return -EPERM;
 	}
 	
-	/* Send to all ready connected peers */
+	/* Send to all ready connected peers via work queue (for safe GATT writes) */
 	int sent = 0;
 	int encrypted = 0;
 	int plaintext = 0;
@@ -3294,51 +3486,26 @@ static int cmd_send(const struct shell *sh, size_t argc, char **argv)
 			
 			/* Check if we have a transport session for encryption */
 			struct noise_session *session = get_session(active_connections[i]);
-			if (session && session->state == NOISE_TRANSPORT) {
-				/* Send encrypted message */
-				if (send_encrypted_message(active_connections[i], bitchat_PKT_MESSAGE, message) == 0) {
-					sent++;
+			
+			/* Queue send work to ble_workq */
+			int conn_idx = get_conn_index(active_connections[i]);
+			if (conn_idx >= 0) {
+				bt_conn_ref(active_connections[i]);
+				send_works[conn_idx].conn = active_connections[i];
+				send_works[conn_idx].handle = handle;
+				send_works[conn_idx].message_len = msg_len;
+				memcpy(send_works[conn_idx].message, message, msg_len);
+				
+				if (session && session->state == NOISE_TRANSPORT) {
+					send_works[conn_idx].is_encrypted = true;
 					encrypted++;
+				} else {
+					send_works[conn_idx].is_encrypted = false;
+					plaintext++;
 				}
-			} else {
-				/* No session - send as plaintext broadcast with TLV encoding */
-				/* Build TLV payload: NICKNAME + CHANNEL + TEXT */
-				uint8_t tlv_payload[256];
-				uint8_t *tlv_ptr = tlv_payload;
 				
-				/* Add nickname TLV */
-				*tlv_ptr++ = bitchat_TLV_NICKNAME;
-				*tlv_ptr++ = strlen(local_identity.nickname);
-				memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
-				tlv_ptr += strlen(local_identity.nickname);
-				
-				/* Add channel TLV */
-				*tlv_ptr++ = bitchat_TLV_CHANNEL;
-				*tlv_ptr++ = strlen(current_channel);
-				memcpy(tlv_ptr, current_channel, strlen(current_channel));
-				tlv_ptr += strlen(current_channel);
-				
-				/* Add text TLV */
-				*tlv_ptr++ = bitchat_TLV_TEXT;
-				*tlv_ptr++ = msg_len;
-				memcpy(tlv_ptr, message, msg_len);
-				tlv_ptr += msg_len;
-				
-				uint16_t total_len = tlv_ptr - tlv_payload;
-				
-				/* Create MESSAGE packet with TLV payload */
-				struct bitchat_packet pkt;
-				if (bitchat_create_packet(&pkt, bitchat_PKT_MESSAGE, bitchat_MAX_TTL,
-				                         tlv_payload, total_len) == 0) {
-					/* Set recipient to broadcast (all peers) */
-					pkt.header.flags |= bitchat_FLAG_HAS_RECIPIENT;
-					pkt.recipient_id = bitchat_BROADCAST_ID;
-					
-					if (bitchat_send_packet(active_connections[i], handle, &pkt) == 0) {
-						sent++;
-						plaintext++;
-					}
-				}
+				k_work_submit_to_queue(&ble_workq, &send_works[conn_idx].work);
+				sent++;
 			}
 		}
 	}
@@ -3446,8 +3613,8 @@ static int cmd_stealth(const struct shell *sh, size_t argc, char **argv)
 			shell_print(sh, "[BLE] Warning: Advertising failed to start (err %d)", err);
 		}
 		
-		/* Initiate handshakes with all connected peers that are ready */
-		int initiated = 0;
+		/* Send Nostr geohash identity broadcasts to all connected peers that are ready */
+		int sent = 0;
 		int pending = 0;
 		for (int i = 0; i < connection_count; i++) {
 			if (active_connections[i]) {
@@ -3456,52 +3623,18 @@ static int cmd_stealth(const struct shell *sh, size_t argc, char **argv)
 					continue;
 				}
 				
-				if (init_session_for_conn(active_connections[i], true) == 0) {
-					struct noise_session *session = get_session(active_connections[i]);
-					if (session) {
-						uint8_t msg1[NOISE_KEY_SIZE];
-						size_t msg1_len;
-						
-						if (noise_handshake_write_message1(session, msg1, &msg1_len) == 0) {
-					/* Build TLV payload: NICKNAME + CHANNEL + NOISE_INIT */
-					uint8_t tlv_payload[256];
-					uint8_t *tlv_ptr = tlv_payload;
-					
-					/* Add nickname TLV */
-					*tlv_ptr++ = bitchat_TLV_NICKNAME;
-					*tlv_ptr++ = strlen(local_identity.nickname);
-					memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
-					tlv_ptr += strlen(local_identity.nickname);
-					
-					/* Add channel TLV */
-					*tlv_ptr++ = bitchat_TLV_CHANNEL;
-					*tlv_ptr++ = strlen(current_channel);
-					memcpy(tlv_ptr, current_channel, strlen(current_channel));
-					tlv_ptr += strlen(current_channel);
-							/* Add INIT TLV */
-							*tlv_ptr++ = bitchat_TLV_NOISE_INIT;
-							*tlv_ptr++ = msg1_len;
-							memcpy(tlv_ptr, msg1, msg1_len);
-							tlv_ptr += msg1_len;
-							
-							uint16_t total_len = tlv_ptr - tlv_payload;
-							
-							/* Send as MESSAGE type with TLV payload */
-							int ret = send_handshake_packet(active_connections[i],
-							                      bitchat_PKT_MESSAGE,  /* Use MESSAGE type */
-							                      tlv_payload, total_len);
-							if (ret == 0) {
-								initiated++;
-							} else if (ret == -EAGAIN) {
-								pending++;
-							}
-						}
-					}
+				/* Submit identity broadcast work to BLE work queue */
+				int conn_idx = get_conn_index(active_connections[i]);
+				if (conn_idx >= 0) {
+					bt_conn_ref(active_connections[i]);
+					identity_broadcast_works[conn_idx].conn = active_connections[i];
+					k_work_submit_to_queue(&ble_workq, &identity_broadcast_works[conn_idx].work);
+					sent++;
 				}
 			}
 		}
 		
-		shell_print(sh, "*** Stealth mode OFF - initiated handshakes with %d peer(s)", initiated);
+		shell_print(sh, "*** Stealth mode OFF - sent identity broadcasts to %d peer(s)", sent);
 		if (pending > 0) {
 			shell_print(sh, "    %d connection(s) not yet ready (MTU/GATT pending)", pending);
 		}
@@ -3835,6 +3968,24 @@ int main(void)
 	for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
 		k_work_init(&handshake_works[i].work, send_handshake_work_handler);
 		handshake_works[i].conn = NULL;
+	}
+	
+	/* Initialize dedicated BLE work queue (separate thread for BLE operations) */
+	k_work_queue_init(&ble_workq);
+	k_work_queue_start(&ble_workq, ble_workq_stack,
+	                   K_THREAD_STACK_SIZEOF(ble_workq_stack),
+	                   BLE_WORKQ_PRIORITY, NULL);
+	
+	/* Initialize identity broadcast work queue structures */
+	for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+		k_work_init(&identity_broadcast_works[i].work, send_identity_broadcast_work_handler);
+		identity_broadcast_works[i].conn = NULL;
+	}
+	
+	/* Initialize send message work structures */
+	for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+		k_work_init(&send_works[i].work, send_message_work_handler);
+		send_works[i].conn = NULL;
 	}
 	
 	/* Initialize debug dissection work */
