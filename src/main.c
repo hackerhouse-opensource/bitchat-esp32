@@ -31,6 +31,9 @@ LOG_MODULE_REGISTER(bitchat, LOG_LEVEL_INF);
 static K_THREAD_STACK_DEFINE(ble_workq_stack, BLE_WORKQ_STACK_SIZE);
 static struct k_work_q ble_workq;
 
+/* Mutex to serialize UART output (prevent interleaved debug output) */
+K_MUTEX_DEFINE(uart_mutex);
+
 /* Forward declarations for globals used by prompt functions */
 static struct bitchat_identity local_identity;
 static char current_channel[32] = "#bluetooth";  /* Default BLE mesh channel */
@@ -509,8 +512,14 @@ static uint16_t bitchat_serialize_packet(const struct bitchat_packet *pkt, uint8
 	/* Calculate data length before padding */
 	uint16_t data_len = ptr - buffer;
 	
-	/* Add padding to 256/512/1024/2048 bytes */
-	uint16_t padded_size = bitchat_pad_packet(buffer, data_len, buffer_size);
+	/* Add padding only for encrypted packets (hide ciphertext length)
+	 * Plaintext packets don't need padding - saves bandwidth */
+	uint16_t padded_size;
+	if (pkt->header.type & 0x20) {  /* Encrypted flag */
+		padded_size = bitchat_pad_packet(buffer, data_len, buffer_size);
+	} else {
+		padded_size = data_len;  /* No padding for plaintext */
+	}
 	
 	return padded_size;
 }
@@ -1207,6 +1216,7 @@ static ssize_t on_message_received(struct bt_conn *conn,
 	/* Parse header (14 bytes) */
 	uint8_t type = ptr[1];
 	uint8_t ttl = ptr[2];
+	(void)ttl;  /* Gossip relay handled in notify_func */
 	uint64_t timestamp_be;
 	memcpy(&timestamp_be, ptr + 3, 8);
 	uint8_t msg_flags = ptr[11];
@@ -1272,6 +1282,9 @@ static void dissect_packet(const uint8_t *data, uint16_t length)
 		return;
 	}
 	
+	/* Lock UART to prevent interleaved output */
+	k_mutex_lock(&uart_mutex, K_FOREVER);
+	
 	/* Parse header */
 	uint8_t version = data[0];
 	(void)version;  /* Reserved for future use */
@@ -1293,19 +1306,36 @@ static void dissect_packet(const uint8_t *data, uint16_t length)
 		payload_len = length > 22 ? length - 22 : 0;
 	}
 	
-	/* Condensed header - single line */
-	const char *type_str = "???";
-	switch (type) {
-	case bitchat_PKT_MESSAGE: type_str = "MSG"; break;
-	case bitchat_PKT_DELIVERY_ACK: type_str = "ACK"; break;
-	case bitchat_PKT_READ_RECEIPT: type_str = "READ"; break;
-	case bitchat_PKT_NOISE_HANDSHAKE: type_str = "HSHK"; break;
-	case bitchat_PKT_NOISE_ENCRYPTED: type_str = "ENC"; break;
-	case bitchat_PKT_FRAGMENT: type_str = "FRAG"; break;
+	/* Condensed but clear header - check for encrypted flag (0x20) */
+	uint8_t base_type = type & 0x1F;  /* Mask off encryption bit */
+	bool is_encrypted = (type & 0x20) != 0;
+	
+	const char *type_str = NULL;
+	switch (base_type) {
+	case bitchat_PKT_MESSAGE: type_str = "MESSAGE"; break;
+	case bitchat_PKT_DELIVERY_ACK: type_str = "DELIVERY_ACK"; break;
+	case bitchat_PKT_READ_RECEIPT: type_str = "READ_RECEIPT"; break;
+	case bitchat_PKT_NOISE_HANDSHAKE: type_str = "NOISE_HANDSHAKE"; break;
+	case bitchat_PKT_NOISE_ENCRYPTED: type_str = "NOISE_ENCRYPTED"; break;
+	case bitchat_PKT_FRAGMENT: type_str = "FRAGMENT"; break;
 	}
 	
-	printk("\n[RX] len=%u type=%s ttl=%u ts=%llu flags=0x%02x payload=%u",
-	       length, type_str, ttl, (unsigned long long)timestamp, flags, payload_len);
+	if (type_str) {
+		if (is_encrypted) {
+			printk("\n[RX] Packet Type: %s (encrypted, 0x%02x)\n", type_str, type);
+		} else {
+			printk("\n[RX] Packet Type: %s (0x%02x)\n", type_str, type);
+		}
+	} else {
+		if (is_encrypted) {
+			printk("\n[RX] Packet Type: UNKNOWN encrypted (0x%02x, base=0x%02x)\n", type, base_type);
+		} else {
+			printk("\n[RX] Packet Type: UNKNOWN (0x%02x)\n", type);
+		}
+	}
+	printk("     Length: %u bytes | TTL: %u | Timestamp: %llu\n",
+	       length, ttl, (unsigned long long)timestamp);
+	printk("     Flags: 0x%02x | Payload: %u bytes\n", flags, payload_len);
 	
 	/* Parse IDs */
 	if (length >= 14 + 8) {
@@ -1343,6 +1373,9 @@ static void dissect_packet(const uint8_t *data, uint16_t length)
 		}
 		printk("|\n");
 	}
+	
+	/* Unlock UART */
+	k_mutex_unlock(&uart_mutex);
 }
 
 /* Parse TLV payload into structured data */
@@ -1350,13 +1383,17 @@ struct tlv_message {
 	char nickname[bitchat_NICKNAME_LEN + 1];
 	char channel[32];
 	char text[MAX_MESSAGE_LEN + 1];
+	char geohash[16];  /* Nostr geohash string */
 	const uint8_t *handshake_data;
+	const uint8_t *pubkey_data;  /* Nostr public key (32 bytes) */
 	uint8_t handshake_len;
 	uint8_t handshake_type;
 	bool has_nickname;
 	bool has_channel;
 	bool has_handshake;
 	bool has_text;
+	bool has_geohash;
+	bool has_pubkey;
 };
 
 static void parse_tlv_payload(const uint8_t *payload, uint16_t payload_len, struct tlv_message *msg)
@@ -1415,6 +1452,15 @@ static void parse_tlv_payload(const uint8_t *payload, uint16_t payload_len, stru
 			memcpy(msg->text, tlv_ptr + 2, tlv_len);
 			msg->text[tlv_len] = '\0';
 			msg->has_text = true;
+		} else if (tlv_type == bitchat_TLV_GEOHASH && tlv_len > 0 && tlv_len < sizeof(msg->geohash)) {
+			/* Parse geohash string (Nostr protocol) */
+			memcpy(msg->geohash, tlv_ptr + 2, tlv_len);
+			msg->geohash[tlv_len] = '\0';
+			msg->has_geohash = true;
+		} else if (tlv_type == bitchat_TLV_PUBKEY && tlv_len == 32) {
+			/* Parse Nostr public key (32 bytes) */
+			msg->pubkey_data = tlv_ptr + 2;
+			msg->has_pubkey = true;
 		} else if (tlv_type == bitchat_TLV_NOISE_INIT || 
 		           tlv_type == bitchat_TLV_NOISE_RESP || 
 		           tlv_type == bitchat_TLV_NOISE_FINISH) {
@@ -1431,12 +1477,9 @@ static void parse_tlv_payload(const uint8_t *payload, uint16_t payload_len, stru
 /* Check if message is a geohash identity broadcast (not a handshake) */
 static bool is_geohash_broadcast(const struct tlv_message *msg)
 {
-	/* Geohash broadcasts are 32-byte INIT/RESP, optionally with channel name
-	 * Android app sends these without channel name (assumes #bluetooth default) */
-	return (msg->has_handshake && 
-	        msg->handshake_len == 32 && 
-	        (msg->handshake_type == bitchat_TLV_NOISE_INIT || 
-	         msg->handshake_type == bitchat_TLV_NOISE_RESP));
+	/* Nostr geohash broadcasts have explicit GEOHASH and/or PUBKEY TLVs
+	 * Noise handshakes (INIT/RESP) are NOT geohash broadcasts - they're E2EE protocol */
+	return (msg->has_geohash || msg->has_pubkey);
 }
 
 /* Handle geohash identity broadcast */
@@ -1518,7 +1561,6 @@ static uint8_t notify_func(struct bt_conn *conn,
 		const uint8_t *ptr = (const uint8_t *)data;
 		
 		/* Parse header (14 bytes) */
-		uint8_t version = ptr[0];
 		uint8_t type = ptr[1];
 		uint8_t ttl = ptr[2];
 		uint8_t flags = ptr[11];
@@ -1855,6 +1897,7 @@ static uint8_t notify_func(struct bt_conn *conn,
 			}
 		}
 		/* === HANDLE ACK/RECEIPT PACKETS === */
+		/* Android BitChat uses DELIVERY_ACK (0x02) for broadcast messages in Nostr protocol */
 		else if ((type == bitchat_PKT_DELIVERY_ACK || type == bitchat_PKT_READ_RECEIPT) && 
 		         payload_len > 0 && payload_len < MAX_MESSAGE_LEN) {
 			
@@ -1863,13 +1906,28 @@ static uint8_t notify_func(struct bt_conn *conn,
 			msg[payload_len] = '\0';
 			
 			const char *nick = get_nickname(sender_id);
+			
+			/* Lock UART for atomic log output */
+			k_mutex_lock(&uart_mutex, K_FOREVER);
 			if (nick) {
-				printk("[ACK] type=%u from 0x%llx (%s): %s\n", 
-				       type, (unsigned long long)sender_id, nick, msg);
+				printk("[MSG] #bluetooth 0x%llx (%s): %s\n", 
+				       (unsigned long long)sender_id, nick, msg);
 			} else {
-				printk("[ACK] type=%u from 0x%llx: %s\n", 
-				       type, (unsigned long long)sender_id, msg);
+				printk("[MSG] #bluetooth 0x%llx: %s\n", 
+				       (unsigned long long)sender_id, msg);
 			}
+			k_mutex_unlock(&uart_mutex);
+			
+			/* Display in message history */
+			char from_str[80];
+			if (nick) {
+				snprintf(from_str, sizeof(from_str), "#bluetooth (%s)", nick);
+			} else {
+				snprintf(from_str, sizeof(from_str), "#bluetooth 0x%llx", 
+				         (unsigned long long)sender_id);
+			}
+			display_message(from_str, msg);
+			messages_received++;
 		}
 		/* === HANDLE LEGACY NOISE HANDSHAKE PACKETS (0x10) === */
 		else if (type == bitchat_PKT_NOISE_HANDSHAKE) {
@@ -2074,7 +2132,10 @@ static void tx_debug_dissect_work_handler(struct k_work *work)
 {
 	struct tx_debug_work *dw = CONTAINER_OF(work, struct tx_debug_work, work);
 	
-	/* Parse header for condensed output */
+	/* Lock UART to prevent interleaved output */
+	k_mutex_lock(&uart_mutex, K_FOREVER);
+	
+	/* Parse header for clear output - check for encrypted flag (0x20) */
 	if (dw->packet_len >= 14) {
 		uint8_t type = dw->packet_data[1];
 		uint8_t ttl = dw->packet_data[2];
@@ -2084,20 +2145,36 @@ static void tx_debug_dissect_work_handler(struct k_work *work)
 		memcpy(&payload_len_be, dw->packet_data + 12, 2);
 		uint16_t payload_len = sys_be16_to_cpu(payload_len_be);
 		
-		const char *type_str = "???";
-		switch (type) {
-		case bitchat_PKT_MESSAGE: type_str = "MSG"; break;
-		case bitchat_PKT_DELIVERY_ACK: type_str = "ACK"; break;
-		case bitchat_PKT_READ_RECEIPT: type_str = "READ"; break;
-		case bitchat_PKT_NOISE_HANDSHAKE: type_str = "HSHK"; break;
-		case bitchat_PKT_NOISE_ENCRYPTED: type_str = "ENC"; break;
-		case bitchat_PKT_FRAGMENT: type_str = "FRAG"; break;
+		uint8_t base_type = type & 0x1F;  /* Mask off encryption bit */
+		bool is_encrypted = (type & 0x20) != 0;
+		
+		const char *type_str = NULL;
+		switch (base_type) {
+		case bitchat_PKT_MESSAGE: type_str = "MESSAGE"; break;
+		case bitchat_PKT_DELIVERY_ACK: type_str = "DELIVERY_ACK"; break;
+		case bitchat_PKT_READ_RECEIPT: type_str = "READ_RECEIPT"; break;
+		case bitchat_PKT_NOISE_HANDSHAKE: type_str = "NOISE_HANDSHAKE"; break;
+		case bitchat_PKT_NOISE_ENCRYPTED: type_str = "NOISE_ENCRYPTED"; break;
+		case bitchat_PKT_FRAGMENT: type_str = "FRAGMENT"; break;
 		}
 		
-		printk("\n[TX] len=%u type=%s ttl=%u flags=0x%02x payload=%u\n",
-		       dw->packet_len, type_str, ttl, flags, payload_len);
+		if (type_str) {
+			if (is_encrypted) {
+				printk("\n[TX] Packet Type: %s (encrypted, 0x%02x)\n", type_str, type);
+			} else {
+				printk("\n[TX] Packet Type: %s (0x%02x)\n", type_str, type);
+			}
+		} else {
+			if (is_encrypted) {
+				printk("\n[TX] Packet Type: UNKNOWN encrypted (0x%02x, base=0x%02x)\n", type, base_type);
+			} else {
+				printk("\n[TX] Packet Type: UNKNOWN (0x%02x)\n", type);
+			}
+		}
+		printk("     Length: %u bytes | TTL: %u | Flags: 0x%02x | Payload: %u bytes\n",
+		       dw->packet_len, ttl, flags, payload_len);
 	} else {
-		printk("\n[TX] len=%u\n", dw->packet_len);
+		printk("\n[TX] Length: %u bytes (incomplete header)\n", dw->packet_len);
 	}
 	
 	/* Full hexdump -C format of entire packet */
@@ -2122,6 +2199,9 @@ static void tx_debug_dissect_work_handler(struct k_work *work)
 		}
 		printk("|\n");
 	}
+	
+	/* Unlock UART */
+	k_mutex_unlock(&uart_mutex);
 }
 
 /* Work handler to send messages - runs in dedicated BLE work queue (for safe GATT writes) */
@@ -2205,15 +2285,13 @@ static void send_identity_broadcast_work_handler(struct k_work *work)
 		return;
 	}
 	
-	/* Build Nostr geohash identity broadcast (TLV format):
-	 * - NICKNAME: User display name
-	 * - CHANNEL: Current channel (e.g., #bluetooth for local mesh)
-	 * - GEOHASH: Location-based identity (7 chars = ~150m precision)
-	 * - PUBKEY: Nostr public key (32-byte Ed25519/X25519 key)
-	 * 
-	 * This is used for proximity-based peer discovery in the mesh network.
-	 * Noise handshakes are ONLY used for privmsg E2EE sessions, NOT for discovery.
-	 */
+	/* Derive geohash identity for current channel (Nostr protocol) */
+	uint8_t channel_hash[32];
+	uint8_t identity_hash[32];
+	derive_geohash_identity(current_channel, channel_hash, identity_hash);
+	
+	/* Build TLV payload: NICKNAME + CHANNEL + CHANNEL_HASH + IDENTITY_HASH + PUBKEY
+	 * This matches Android BitChat client's Nostr peer discovery protocol */
 	uint8_t tlv_payload[256];
 	uint8_t *tlv_ptr = tlv_payload;
 	
@@ -2223,34 +2301,37 @@ static void send_identity_broadcast_work_handler(struct k_work *work)
 	memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
 	tlv_ptr += strlen(local_identity.nickname);
 	
-	/* Add channel */
+	/* Add channel name */
 	*tlv_ptr++ = bitchat_TLV_CHANNEL;
 	*tlv_ptr++ = strlen(current_channel);
 	memcpy(tlv_ptr, current_channel, strlen(current_channel));
 	tlv_ptr += strlen(current_channel);
 	
-	/* Add geohash (7 character precision ~150m for proximity-based mesh) */
-	char geohash_str[12];
-	encode_geohash(gps_latitude, gps_longitude, 7, geohash_str);
-	*tlv_ptr++ = bitchat_TLV_GEOHASH;
-	*tlv_ptr++ = strlen(geohash_str);
-	memcpy(tlv_ptr, geohash_str, strlen(geohash_str));
-	tlv_ptr += strlen(geohash_str);
+	/* Add channel hash (TLV 0x02, 32 bytes) - identifies which channel */
+	*tlv_ptr++ = bitchat_TLV_NOISE_INIT;  /* Reusing type 0x02 for channel hash */
+	*tlv_ptr++ = 32;
+	memcpy(tlv_ptr, channel_hash, 32);
+	tlv_ptr += 32;
 	
-	/* Add Nostr public key (32 bytes - X25519 static key used as Nostr identity) */
+	/* Add identity hash (TLV 0x03, 32 bytes) - peer's identity for this channel */
+	*tlv_ptr++ = bitchat_TLV_NOISE_RESP;  /* Reusing type 0x03 for identity hash */
+	*tlv_ptr++ = 32;
+	memcpy(tlv_ptr, identity_hash, 32);
+	tlv_ptr += 32;
+	
+	/* Add public key (TLV 0x09, 32 bytes) - Nostr pubkey */
 	*tlv_ptr++ = bitchat_TLV_PUBKEY;
-	*tlv_ptr++ = NOISE_KEY_SIZE;
-	memcpy(tlv_ptr, local_identity.noise_public, NOISE_KEY_SIZE);
-	tlv_ptr += NOISE_KEY_SIZE;
+	*tlv_ptr++ = 32;
+	memcpy(tlv_ptr, local_identity.noise_public, 32);
+	tlv_ptr += 32;
 	
 	uint16_t total_len = tlv_ptr - tlv_payload;
 	
-	/* Send as PKT_MESSAGE (NOT PKT_NOISE_HANDSHAKE - that's only for privmsg E2EE) */
+	/* Send as PKT_MESSAGE with Nostr geohash identity (Android BitChat protocol) */
 	int ret = send_handshake_packet(conn, bitchat_PKT_MESSAGE, tlv_payload, total_len);
 	if (ret == 0) {
 		if (debug_enabled) {
-			printk("[Nostr] Sent geohash identity broadcast (geohash: %s, channel: %s)\n",
-			       geohash_str, current_channel);
+			printk("[Nostr] Sent geohash identity broadcast (channel: %s)\n", current_channel);
 		}
 	} else {
 		printk("[Nostr] ERROR: Failed to send identity broadcast (ret=%d)\n", ret);
@@ -2366,7 +2447,7 @@ return;
  * bt_gatt_write_without_response from within GATT callback context */
 if (!stealth_mode) {
 	if (debug_enabled) {
-		printk("[GATT] Preparing to send Nostr identity broadcast to peer...\n");
+		printk("[GATT] Preparing to send handshake INIT to peer...\n");
 	}
 	/* Submit identity broadcast work to BLE work queue (dedicated thread) */
 	bt_conn_ref(conn);  /* Take reference for work handler */
@@ -3634,7 +3715,7 @@ static int cmd_stealth(const struct shell *sh, size_t argc, char **argv)
 			}
 		}
 		
-		shell_print(sh, "*** Stealth mode OFF - sent identity broadcasts to %d peer(s)", sent);
+		shell_print(sh, "*** Stealth mode OFF - sent handshakes to %d peer(s)", sent);
 		if (pending > 0) {
 			shell_print(sh, "    %d connection(s) not yet ready (MTU/GATT pending)", pending);
 		}
