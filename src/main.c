@@ -1297,6 +1297,129 @@ static bt_addr_le_t target_addr;
 static void connect_work_handler(struct k_work *work);
 static K_WORK_DELAYABLE_DEFINE(connect_work, connect_work_handler);
 
+/* TLV message structure for parsing packet payloads */
+struct tlv_message {
+	char nickname[bitchat_NICKNAME_LEN + 1];
+	char channel[32];
+	char text[MAX_MESSAGE_LEN + 1];
+	char geohash[16];  /* Nostr geohash string */
+	const uint8_t *handshake_data;
+	const uint8_t *pubkey_data;  /* Nostr public key (32 bytes) */
+	const uint8_t *noise_public_key;  /* Static Noise public key (32 bytes, TLV 0x02) */
+	const uint8_t *signing_public_key; /* Ed25519 signing public key (32 bytes, TLV 0x03) */
+	uint8_t handshake_len;
+	uint8_t handshake_type;
+	bool has_nickname;
+	bool has_channel;
+	bool has_handshake;
+	bool has_text;
+	bool has_geohash;
+	bool has_pubkey;
+	bool has_noise_public_key;   /* TLV 0x02 with 32 bytes */
+	bool has_signing_public_key;  /* TLV 0x03 with 32 bytes */
+};
+
+static void parse_tlv_payload(const uint8_t *payload, uint16_t payload_len, struct tlv_message *msg)
+{
+	memset(msg, 0, sizeof(*msg));
+	const uint8_t *tlv_ptr = payload;
+	
+	/* Security: Add iteration limit to prevent infinite loops */
+	uint16_t iterations = 0;
+	const uint16_t MAX_TLV_ITERATIONS = 50;
+	
+	while ((tlv_ptr - payload) + 2 <= payload_len && iterations < MAX_TLV_ITERATIONS) {
+		iterations++;
+		
+		uint8_t tlv_type = tlv_ptr[0];
+		uint8_t tlv_len = tlv_ptr[1];
+		
+		/* Security: Validate TLV length */
+		if (tlv_len == 0 || (tlv_ptr - payload) + 2 + tlv_len > payload_len) {
+			break;
+		}
+		
+		if (tlv_type == bitchat_TLV_NICKNAME && tlv_len > 0 && tlv_len < sizeof(msg->nickname)) {
+			/* Security: Validate nickname is printable ASCII */
+			bool is_valid = true;
+			for (uint8_t i = 0; i < tlv_len; i++) {
+				uint8_t c = tlv_ptr[2 + i];
+				if (c < 32 || c > 126) {
+					is_valid = false;
+					break;
+				}
+			}
+			if (is_valid) {
+				memcpy(msg->nickname, tlv_ptr + 2, tlv_len);
+				msg->nickname[tlv_len] = '\0';
+				msg->has_nickname = true;
+			}
+		} else if (tlv_type == bitchat_TLV_CHANNEL && tlv_len < sizeof(msg->channel)) {
+			memcpy(msg->channel, tlv_ptr + 2, tlv_len);
+			msg->channel[tlv_len] = '\0';
+			/* Verify channel is printable ASCII */
+			bool is_printable = true;
+			for (int i = 0; i < tlv_len; i++) {
+				if (msg->channel[i] < 32 || msg->channel[i] > 126) {
+					is_printable = false;
+					break;
+				}
+			}
+			if (is_printable) {
+				msg->has_channel = true;
+			} else {
+				msg->channel[0] = '\0';
+			}
+		} else if (tlv_type == bitchat_TLV_TEXT && tlv_len > 0 && tlv_len <= MAX_MESSAGE_LEN) {
+			/* Parse text message field */
+			memcpy(msg->text, tlv_ptr + 2, tlv_len);
+			msg->text[tlv_len] = '\0';
+			msg->has_text = true;
+		} else if (tlv_type == bitchat_TLV_GEOHASH && tlv_len > 0 && tlv_len < sizeof(msg->geohash)) {
+			/* Parse geohash string (Nostr protocol) */
+			memcpy(msg->geohash, tlv_ptr + 2, tlv_len);
+			msg->geohash[tlv_len] = '\0';
+			msg->has_geohash = true;
+		} else if (tlv_type == bitchat_TLV_PUBKEY && tlv_len == 32) {
+			/* Parse Nostr public key (32 bytes) */
+			msg->pubkey_data = tlv_ptr + 2;
+			msg->has_pubkey = true;
+		} else if (tlv_type == bitchat_TLV_NOISE_INIT) {
+			if (tlv_len == 32) {
+				/* TLV 0x02 with 32 bytes = Static Noise public key (identity announcement) */
+				msg->noise_public_key = tlv_ptr + 2;
+				msg->has_noise_public_key = true;
+			} else {
+				/* TLV 0x02 with other length = Noise INIT handshake (ephemeral key) */
+				msg->handshake_type = tlv_type;
+				msg->handshake_len = tlv_len;
+				msg->handshake_data = tlv_ptr + 2;
+				msg->has_handshake = true;
+			}
+		} else if (tlv_type == bitchat_TLV_NOISE_RESP) {
+			if (tlv_len == 32) {
+				/* TLV 0x03 with 32 bytes = Ed25519 signing public key (identity announcement) */
+				msg->signing_public_key = tlv_ptr + 2;
+				msg->has_signing_public_key = true;
+			} else {
+				/* TLV 0x03 with other length = Noise RESP handshake (ephemeral key) */
+				msg->handshake_type = tlv_type;
+				msg->handshake_len = tlv_len;
+				msg->handshake_data = tlv_ptr + 2;
+				msg->has_handshake = true;
+			}
+		} else if (tlv_type == bitchat_TLV_NOISE_FINISH) {
+			/* TLV 0x04 = Noise FINISH handshake */
+			msg->handshake_type = tlv_type;
+			msg->handshake_len = tlv_len;
+			msg->handshake_data = tlv_ptr + 2;
+			msg->has_handshake = true;
+		}
+		
+		tlv_ptr += 2 + tlv_len;
+	}
+}
+
 /* Packet dissector - compact format to minimize printk overhead */
 static void dissect_packet(const uint8_t *data, uint16_t length)
 {
@@ -1396,112 +1519,99 @@ static void dissect_packet(const uint8_t *data, uint16_t length)
 		printk("|\n");
 	}
 	
+	/* Parse and display TLV contents for MESSAGE packets */
+	if (base_type == bitchat_PKT_MESSAGE && payload_len > 0 && length >= 14 + 8 + payload_len) {
+		const uint8_t *payload_start = data + 14 + 8;  /* Skip header + sender_id */
+		if (flags & bitchat_FLAG_HAS_RECIPIENT) {
+			payload_start += 8;  /* Skip recipient_id if present */
+		}
+		
+		/* Parse TLV fields */
+		struct tlv_message tlv_msg;
+		parse_tlv_payload(payload_start, payload_len, &tlv_msg);
+		
+		/* Display parsed TLV fields */
+		bool printed_tlv_header = false;
+		
+		if (tlv_msg.has_nickname) {
+			if (!printed_tlv_header) {
+				printk("  TLV fields:\n");
+				printed_tlv_header = true;
+			}
+			printk("    [0x01] Nickname: \"%s\"\n", tlv_msg.nickname);
+		}
+		
+		if (tlv_msg.has_noise_public_key) {
+			if (!printed_tlv_header) {
+				printk("  TLV fields:\n");
+				printed_tlv_header = true;
+			}
+			printk("    [0x02] Noise Public Key (32 bytes): ");
+			for (int i = 0; i < 32; i++) printk("%02x", tlv_msg.noise_public_key[i]);
+			printk("\n");
+		}
+		
+		if (tlv_msg.has_signing_public_key) {
+			if (!printed_tlv_header) {
+				printk("  TLV fields:\n");
+				printed_tlv_header = true;
+			}
+			printk("    [0x03] Signing Public Key (32 bytes): ");
+			for (int i = 0; i < 32; i++) printk("%02x", tlv_msg.signing_public_key[i]);
+			printk("\n");
+		}
+		
+		if (tlv_msg.has_handshake) {
+			if (!printed_tlv_header) {
+				printk("  TLV fields:\n");
+				printed_tlv_header = true;
+			}
+			const char *hs_name = "UNKNOWN";
+			if (tlv_msg.handshake_type == bitchat_TLV_NOISE_INIT) hs_name = "INIT";
+			else if (tlv_msg.handshake_type == bitchat_TLV_NOISE_RESP) hs_name = "RESP";
+			else if (tlv_msg.handshake_type == bitchat_TLV_NOISE_FINISH) hs_name = "FINISH";
+			printk("    [0x%02x] Noise Handshake %s (%u bytes)\n", 
+			       tlv_msg.handshake_type, hs_name, tlv_msg.handshake_len);
+		}
+		
+		if (tlv_msg.has_text) {
+			if (!printed_tlv_header) {
+				printk("  TLV fields:\n");
+				printed_tlv_header = true;
+			}
+			printk("    [0x05] Text: \"%s\"\n", tlv_msg.text);
+		}
+		
+		if (tlv_msg.has_channel) {
+			if (!printed_tlv_header) {
+				printk("  TLV fields:\n");
+				printed_tlv_header = true;
+			}
+			printk("    [0x07] Channel: \"%s\"\n", tlv_msg.channel);
+		}
+		
+		if (tlv_msg.has_pubkey) {
+			if (!printed_tlv_header) {
+				printk("  TLV fields:\n");
+				printed_tlv_header = true;
+			}
+			printk("    [0x09] Nostr Pubkey (32 bytes)\n");
+		}
+	}
+	
 	/* Unlock UART */
 	k_mutex_unlock(&uart_mutex);
-}
-
-/* Parse TLV payload into structured data */
-struct tlv_message {
-	char nickname[bitchat_NICKNAME_LEN + 1];
-	char channel[32];
-	char text[MAX_MESSAGE_LEN + 1];
-	char geohash[16];  /* Nostr geohash string */
-	const uint8_t *handshake_data;
-	const uint8_t *pubkey_data;  /* Nostr public key (32 bytes) */
-	uint8_t handshake_len;
-	uint8_t handshake_type;
-	bool has_nickname;
-	bool has_channel;
-	bool has_handshake;
-	bool has_text;
-	bool has_geohash;
-	bool has_pubkey;
-};
-
-static void parse_tlv_payload(const uint8_t *payload, uint16_t payload_len, struct tlv_message *msg)
-{
-	memset(msg, 0, sizeof(*msg));
-	const uint8_t *tlv_ptr = payload;
-	
-	/* Security: Add iteration limit to prevent infinite loops */
-	uint16_t iterations = 0;
-	const uint16_t MAX_TLV_ITERATIONS = 50;
-	
-	while ((tlv_ptr - payload) + 2 <= payload_len && iterations < MAX_TLV_ITERATIONS) {
-		iterations++;
-		
-		uint8_t tlv_type = tlv_ptr[0];
-		uint8_t tlv_len = tlv_ptr[1];
-		
-		/* Security: Validate TLV length */
-		if (tlv_len == 0 || (tlv_ptr - payload) + 2 + tlv_len > payload_len) {
-			break;
-		}
-		
-		if (tlv_type == bitchat_TLV_NICKNAME && tlv_len > 0 && tlv_len < sizeof(msg->nickname)) {
-			/* Security: Validate nickname is printable ASCII */
-			bool is_valid = true;
-			for (uint8_t i = 0; i < tlv_len; i++) {
-				uint8_t c = tlv_ptr[2 + i];
-				if (c < 32 || c > 126) {
-					is_valid = false;
-					break;
-				}
-			}
-			if (is_valid) {
-				memcpy(msg->nickname, tlv_ptr + 2, tlv_len);
-				msg->nickname[tlv_len] = '\0';
-				msg->has_nickname = true;
-			}
-		} else if (tlv_type == bitchat_TLV_CHANNEL && tlv_len < sizeof(msg->channel)) {
-			memcpy(msg->channel, tlv_ptr + 2, tlv_len);
-			msg->channel[tlv_len] = '\0';
-			/* Verify channel is printable ASCII */
-			bool is_printable = true;
-			for (int i = 0; i < tlv_len; i++) {
-				if (msg->channel[i] < 32 || msg->channel[i] > 126) {
-					is_printable = false;
-					break;
-				}
-			}
-			if (is_printable) {
-				msg->has_channel = true;
-			} else {
-				msg->channel[0] = '\0';
-			}
-		} else if (tlv_type == bitchat_TLV_TEXT && tlv_len > 0 && tlv_len <= MAX_MESSAGE_LEN) {
-			/* Parse text message field */
-			memcpy(msg->text, tlv_ptr + 2, tlv_len);
-			msg->text[tlv_len] = '\0';
-			msg->has_text = true;
-		} else if (tlv_type == bitchat_TLV_GEOHASH && tlv_len > 0 && tlv_len < sizeof(msg->geohash)) {
-			/* Parse geohash string (Nostr protocol) */
-			memcpy(msg->geohash, tlv_ptr + 2, tlv_len);
-			msg->geohash[tlv_len] = '\0';
-			msg->has_geohash = true;
-		} else if (tlv_type == bitchat_TLV_PUBKEY && tlv_len == 32) {
-			/* Parse Nostr public key (32 bytes) */
-			msg->pubkey_data = tlv_ptr + 2;
-			msg->has_pubkey = true;
-		} else if (tlv_type == bitchat_TLV_NOISE_INIT || 
-		           tlv_type == bitchat_TLV_NOISE_RESP || 
-		           tlv_type == bitchat_TLV_NOISE_FINISH) {
-			msg->handshake_type = tlv_type;
-			msg->handshake_len = tlv_len;
-			msg->handshake_data = tlv_ptr + 2;
-			msg->has_handshake = true;
-		}
-		
-		tlv_ptr += 2 + tlv_len;
-	}
 }
 
 /* Check if message is a geohash identity broadcast (not a handshake) */
 static bool is_geohash_broadcast(const struct tlv_message *msg)
 {
-	/* Nostr geohash broadcasts have explicit GEOHASH and/or PUBKEY TLVs
-	 * Noise handshakes (INIT/RESP) are NOT geohash broadcasts - they're E2EE protocol */
-	return (msg->has_geohash || msg->has_pubkey);
+	/* Identity announcements have:
+	 * - PUBKEY TLV (Nostr geohash style), OR
+	 * - TLV 0x02 + TLV 0x03 with 32-byte static keys (Bluetooth mesh style)
+	 * Noise handshakes are NOT identity announcements - they're E2EE protocol */
+	return (msg->has_pubkey || 
+	        (msg->has_noise_public_key && msg->has_signing_public_key));
 }
 
 /* Handle geohash identity broadcast */
@@ -1510,6 +1620,45 @@ static void handle_geohash_broadcast(const struct tlv_message *msg, uint64_t sen
 	/* Use provided channel or default to #bluetooth */
 	const char *channel = msg->has_channel ? msg->channel : "#bluetooth";
 	
+	/* Check for Bluetooth mesh identity announcement (TLV 0x02 + 0x03 with 32-byte keys) */
+	if (msg->has_noise_public_key && msg->has_signing_public_key) {
+		/* Android/iOS Bluetooth mesh format: static Noise key + signing key */
+		store_geohash(channel, msg->noise_public_key, msg->signing_public_key);
+		if (debug_enabled) {
+			printk("[Identity] Stored peer announcement for %s from %s\n", 
+			       channel, msg->nickname);
+		}
+		
+		/* Update peer cache with location channel */
+		for (int i = 0; i < PEER_CACHE_SIZE; i++) {
+			if (peer_cache[i].valid && peer_cache[i].sender_id == sender_id) {
+				strncpy(peer_cache[i].channel, channel, 
+				        sizeof(peer_cache[i].channel) - 1);
+				peer_cache[i].channel[sizeof(peer_cache[i].channel) - 1] = '\0';
+				if (debug_enabled) {
+					printk("[Peer] Updated location channel %s for %s\n", 
+					       channel, msg->nickname);
+				}
+				break;
+			}
+		}
+		
+		/* Display identity announcement info */
+		printk("[RX] Identity announcement from 0x%llx (%s@%s)\n",
+		       (unsigned long long)sender_id, msg->nickname, channel);
+		printk("  Noise key: ");
+		for (uint8_t i = 0; i < 32; i++) {
+			printk("%02x", msg->noise_public_key[i]);
+		}
+		printk("\n  Signing key: ");
+		for (uint8_t i = 0; i < 32; i++) {
+			printk("%02x", msg->signing_public_key[i]);
+		}
+		printk("\n");
+		return;
+	}
+	
+	/* Legacy ESP32 format: check handshake_type for INIT/RESP */
 	if (msg->handshake_type == bitchat_TLV_NOISE_INIT) {
 		/* Channel hash */
 		store_geohash(channel, msg->handshake_data, NULL);
@@ -1674,24 +1823,13 @@ static void packet_process_work_handler(struct k_work *work)
 			if (is_geohash_broadcast(&tlv_msg)) {
 				handle_geohash_broadcast(&tlv_msg, sender_id);
 				
-				/* Track peer so they appear in list command */
+				/* Track peer so they appear in list command - use static keys from identity announcement */
 				add_or_update_peer(sender_id, tlv_msg.nickname,
 				                  tlv_msg.has_channel ? tlv_msg.channel : "#bluetooth",
 				                  bt_conn_get_dst(conn),
-				                  tlv_msg.handshake_data,
-				                  NULL,
-				                  true);
-				
-				return;  /* Don't process as Noise handshake */
-			}
-			
-			/* === OFFLOAD HANDSHAKE PROCESSING TO WORKER === */
-			if (stealth_mode) {
-				return;  /* Silently ignore handshakes in stealth mode */
-			}
-			
-			/* Queue handshake for processing in ble_workq */
-			if (k_work_busy_get(&handshake_work_item.work) == 0) {
+				                  tlv_msg.noise_public_key,
+			                  tlv_msg.signing_public_key,
+			                  true);  /* is_connected = true since we received this over BLE */
 				handshake_work_item.conn = conn;
 				handshake_work_item.sender_id = sender_id;
 				handshake_work_item.handshake_type = tlv_msg.handshake_type;
@@ -2017,7 +2155,7 @@ static void handshake_process_work_handler(struct k_work *work)
 			size_t msg2_len;
 			
 			if (noise_handshake_write_message2(session, &local_identity, msg2, &msg2_len) == 0) {
-				/* Build TLV response: NICKNAME + CHANNEL + NOISE_RESP */
+				/* Build TLV response: NICKNAME + NOISE_RESP (ephemeral key) */
 				uint8_t tlv_payload[256];
 				uint8_t *tlv_ptr = tlv_payload;
 				
@@ -2027,13 +2165,7 @@ static void handshake_process_work_handler(struct k_work *work)
 				memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
 				tlv_ptr += strlen(local_identity.nickname);
 				
-				/* TLV: Channel (use Nostr channel hash) */
-				*tlv_ptr++ = bitchat_TLV_CHANNEL;
-				*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
-				memcpy(tlv_ptr, current_channel_hash, 32);
-				tlv_ptr += 32;
-				
-				/* TLV: NOISE_RESP */
+				/* TLV: NOISE_RESP (ephemeral key - NOT 32 bytes) */
 				*tlv_ptr++ = bitchat_TLV_NOISE_RESP;
 				*tlv_ptr++ = msg2_len;
 				memcpy(tlv_ptr, msg2, msg2_len);
@@ -2080,12 +2212,6 @@ static void handshake_process_work_handler(struct k_work *work)
 					*tlv_ptr++ = strlen(local_identity.nickname);
 					memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
 					tlv_ptr += strlen(local_identity.nickname);
-					
-					/* TLV: Channel (use Nostr channel hash) */
-					*tlv_ptr++ = bitchat_TLV_CHANNEL;
-					*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
-					memcpy(tlv_ptr, current_channel_hash, 32);
-					tlv_ptr += 32;
 					
 					/* TLV: NOISE_FINISH */
 					*tlv_ptr++ = bitchat_TLV_NOISE_FINISH;
@@ -2152,11 +2278,11 @@ static void handshake_process_work_handler(struct k_work *work)
 					memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
 					tlv_ptr += strlen(local_identity.nickname);
 					
-				/* TLV: Channel (use Nostr channel hash) */
-				*tlv_ptr++ = bitchat_TLV_CHANNEL;
-				*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
-				memcpy(tlv_ptr, current_channel_hash, 32);
-				tlv_ptr += 32;
+					/* TLV: NOISE_RESP (ephemeral key - NOT 32 bytes) */
+					*tlv_ptr++ = bitchat_TLV_NOISE_RESP;
+					*tlv_ptr++ = msg2_len;
+					memcpy(tlv_ptr, msg2, msg2_len);
+					tlv_ptr += msg2_len;
 					
 					uint16_t total_len = tlv_ptr - tlv_payload;
 					
@@ -2217,11 +2343,13 @@ static void send_message_work_handler(struct k_work *work)
 		memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
 		tlv_ptr += strlen(local_identity.nickname);
 		
-/* Add channel TLV (use Nostr channel hash) */
-	*tlv_ptr++ = bitchat_TLV_CHANNEL;
-	*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
-	memcpy(tlv_ptr, current_channel_hash, 32);
-	tlv_ptr += 32;
+		/* Add channel hash TLV for message routing (32-byte SHA256) */
+		/* Note: TLV 0x02 is overloaded - 32 bytes can be static key OR channel hash */
+		/* Context determines meaning: in messages = channel, in announcements = key */
+		*tlv_ptr++ = bitchat_TLV_NOISE_INIT;
+		*tlv_ptr++ = 32;
+		memcpy(tlv_ptr, current_channel_hash, 32);
+		tlv_ptr += 32;
 		
 		/* Add text TLV */
 		*tlv_ptr++ = bitchat_TLV_TEXT;
@@ -2269,13 +2397,8 @@ static void send_identity_broadcast_work_handler(struct k_work *work)
 		return;
 	}
 	
-	/* Derive geohash identity for current channel (Nostr protocol) */
-	uint8_t channel_hash[32];
-	uint8_t identity_hash[32];
-	derive_geohash_identity(current_channel, channel_hash, identity_hash);
-	
-	/* Build TLV payload: NICKNAME + CHANNEL + CHANNEL_HASH + IDENTITY_HASH + PUBKEY
-	 * This matches Android BitChat client's Nostr peer discovery protocol */
+	/* Build TLV payload for identity announcement: NICKNAME + NOISE_PUBLIC_KEY + SIGNING_PUBLIC_KEY
+	 * This matches Android/iOS BitChat Bluetooth mesh identity announcement protocol */
 	uint8_t tlv_payload[256];
 	uint8_t *tlv_ptr = tlv_payload;
 	
@@ -2285,40 +2408,29 @@ static void send_identity_broadcast_work_handler(struct k_work *work)
 	memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
 	tlv_ptr += strlen(local_identity.nickname);
 	
-	/* Add channel name (use Nostr channel hash) */
-	*tlv_ptr++ = bitchat_TLV_CHANNEL;
-	*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
-	memcpy(tlv_ptr, current_channel_hash, 32);
+	/* Add static Noise public key (TLV 0x02, 32 bytes) - for E2EE session establishment */
+	*tlv_ptr++ = bitchat_TLV_NOISE_INIT;  /* Type 0x02 with 32 bytes = static key (not handshake) */
+	*tlv_ptr++ = 32;
+	memcpy(tlv_ptr, local_identity.noise_public, 32);
 	tlv_ptr += 32;
 	
-	/* Add channel hash (TLV 0x02, 32 bytes) - identifies which channel */
-	*tlv_ptr++ = bitchat_TLV_NOISE_INIT;  /* Reusing type 0x02 for channel hash */
+	/* Add Ed25519 signing public key (TLV 0x03, 32 bytes) - for message verification */
+	*tlv_ptr++ = bitchat_TLV_NOISE_RESP;  /* Type 0x03 with 32 bytes = signing key (not handshake) */
 	*tlv_ptr++ = 32;
-	memcpy(tlv_ptr, channel_hash, 32);
-	tlv_ptr += 32;
-	
-	/* Add identity hash (TLV 0x03, 32 bytes) - peer's identity for this channel */
-	*tlv_ptr++ = bitchat_TLV_NOISE_RESP;  /* Reusing type 0x03 for identity hash */
-	*tlv_ptr++ = 32;
-	memcpy(tlv_ptr, identity_hash, 32);
-	tlv_ptr += 32;
-	
-	/* Add public key (TLV 0x09, 32 bytes) - Nostr pubkey */
-	*tlv_ptr++ = bitchat_TLV_PUBKEY;
-	*tlv_ptr++ = 32;
+	/* TODO: Use actual Ed25519 signing key when available, for now reuse noise_public */
 	memcpy(tlv_ptr, local_identity.noise_public, 32);
 	tlv_ptr += 32;
 	
 	uint16_t total_len = tlv_ptr - tlv_payload;
 	
-	/* Send as PKT_MESSAGE with Nostr geohash identity (Android BitChat protocol) */
+	/* Send as PKT_MESSAGE with identity announcement (Android/iOS BitChat protocol) */
 	int ret = send_handshake_packet(conn, bitchat_PKT_MESSAGE, tlv_payload, total_len);
 	if (ret == 0) {
 		if (debug_enabled) {
-			printk("[Nostr] Sent geohash identity broadcast (channel: %s)\n", current_channel);
+			printk("[Identity] Sent identity announcement (channel: %s)\n", current_channel);
 		}
 	} else {
-		printk("[Nostr] ERROR: Failed to send identity broadcast (ret=%d)\n", ret);
+		printk("[Identity] ERROR: Failed to send identity announcement (ret=%d)\n", ret);
 	}
 	
 	/* Release reference taken when submitting work */
@@ -2363,12 +2475,7 @@ static void send_handshake_work_handler(struct k_work *work)
 		memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
 		tlv_ptr += strlen(local_identity.nickname);
 		
-/* TLV: Channel (use Nostr channel hash) */
-	*tlv_ptr++ = bitchat_TLV_CHANNEL;
-	*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
-	memcpy(tlv_ptr, current_channel_hash, 32);
-	tlv_ptr += 32;
-		
+		/* TLV: NOISE_INIT (ephemeral key - NOT 32 bytes) */
 		*tlv_ptr++ = bitchat_TLV_NOISE_INIT;
 		*tlv_ptr++ = msg1_len;
 		memcpy(tlv_ptr, msg1, msg1_len);
@@ -3088,12 +3195,30 @@ static int cmd_list(const struct shell *sh, size_t argc, char **argv)
 		for (int j = 0; j < 32; j += 16) {
 			shell_print(sh, "    %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
 			           peer_cache[i].noise_pubkey[j+0], peer_cache[i].noise_pubkey[j+1],
-				           peer_cache[i].sign_pubkey[j+8], peer_cache[i].sign_pubkey[j+9],
-				           peer_cache[i].sign_pubkey[j+10], peer_cache[i].sign_pubkey[j+11],
-				           peer_cache[i].sign_pubkey[j+12], peer_cache[i].sign_pubkey[j+13],
-				           peer_cache[i].sign_pubkey[j+14], peer_cache[i].sign_pubkey[j+15]);
-			}
+			           peer_cache[i].noise_pubkey[j+2], peer_cache[i].noise_pubkey[j+3],
+			           peer_cache[i].noise_pubkey[j+4], peer_cache[i].noise_pubkey[j+5],
+			           peer_cache[i].noise_pubkey[j+6], peer_cache[i].noise_pubkey[j+7],
+			           peer_cache[i].noise_pubkey[j+8], peer_cache[i].noise_pubkey[j+9],
+			           peer_cache[i].noise_pubkey[j+10], peer_cache[i].noise_pubkey[j+11],
+			           peer_cache[i].noise_pubkey[j+12], peer_cache[i].noise_pubkey[j+13],
+			           peer_cache[i].noise_pubkey[j+14], peer_cache[i].noise_pubkey[j+15]);
 		}
+	}
+	
+	if (peer_cache[i].has_sign_pubkey) {
+		shell_print(sh, "  Signing Key (Ed25519):");
+		for (int j = 0; j < 32; j += 16) {
+			shell_print(sh, "    %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+			           peer_cache[i].sign_pubkey[j+0], peer_cache[i].sign_pubkey[j+1],
+			           peer_cache[i].sign_pubkey[j+2], peer_cache[i].sign_pubkey[j+3],
+			           peer_cache[i].sign_pubkey[j+4], peer_cache[i].sign_pubkey[j+5],
+			           peer_cache[i].sign_pubkey[j+6], peer_cache[i].sign_pubkey[j+7],
+			           peer_cache[i].sign_pubkey[j+8], peer_cache[i].sign_pubkey[j+9],
+			           peer_cache[i].sign_pubkey[j+10], peer_cache[i].sign_pubkey[j+11],
+			           peer_cache[i].sign_pubkey[j+12], peer_cache[i].sign_pubkey[j+13],
+			           peer_cache[i].sign_pubkey[j+14], peer_cache[i].sign_pubkey[j+15]);
+		}
+	}
 	}
 	
 	if (count == 0) {
