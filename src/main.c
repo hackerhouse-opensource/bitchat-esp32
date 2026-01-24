@@ -3056,9 +3056,10 @@ static int cmd_list(const struct shell *sh, size_t argc, char **argv)
 					if (session) {
 						const char *state_str = "UNKNOWN";
 						switch (session->state) {
-							case NOISE_IDLE: state_str = "IDLE"; break;
 							case NOISE_INIT: state_str = "INIT"; break;
-							case NOISE_RESP: state_str = "RESP"; break;
+							case NOISE_SENT_E: state_str = "SENT_E"; break;
+							case NOISE_RECEIVED_EES_S_ES: state_str = "RECEIVED_EES_S_ES"; break;
+							case NOISE_SENT_S_SE: state_str = "SENT_S_SE"; break;
 							case NOISE_TRANSPORT: state_str = "TRANSPORT"; break;
 						}
 						shell_print(sh, "  Noise:      %s", state_str);
@@ -3074,24 +3075,19 @@ static int cmd_list(const struct shell *sh, size_t argc, char **argv)
 			}
 		}
 	}
-				           peer_cache[i].noise_pubkey[j+2], peer_cache[i].noise_pubkey[j+3],
-				           peer_cache[i].noise_pubkey[j+4], peer_cache[i].noise_pubkey[j+5],
-				           peer_cache[i].noise_pubkey[j+6], peer_cache[i].noise_pubkey[j+7],
-				           peer_cache[i].noise_pubkey[j+8], peer_cache[i].noise_pubkey[j+9],
-				           peer_cache[i].noise_pubkey[j+10], peer_cache[i].noise_pubkey[j+11],
-				           peer_cache[i].noise_pubkey[j+12], peer_cache[i].noise_pubkey[j+13],
-				           peer_cache[i].noise_pubkey[j+14], peer_cache[i].noise_pubkey[j+15]);
-			}
-		}
-		
-		if (peer_cache[i].has_sign_pubkey) {
-			shell_print(sh, "  Sign Key (Ed25519):");
-			for (int j = 0; j < 32; j += 16) {
-				shell_print(sh, "    %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-				           peer_cache[i].sign_pubkey[j+0], peer_cache[i].sign_pubkey[j+1],
-				           peer_cache[i].sign_pubkey[j+2], peer_cache[i].sign_pubkey[j+3],
-				           peer_cache[i].sign_pubkey[j+4], peer_cache[i].sign_pubkey[j+5],
-				           peer_cache[i].sign_pubkey[j+6], peer_cache[i].sign_pubkey[j+7],
+	
+	uint64_t age_ms = k_uptime_get() - peer_cache[i].last_seen;
+	if (age_ms < 1000) {
+		shell_print(sh, "  Last seen:  %llu ms ago", (unsigned long long)age_ms);
+	} else {
+		shell_print(sh, "  Last seen:  %llu sec ago", (unsigned long long)(age_ms / 1000));
+	}
+	
+	if (peer_cache[i].has_noise_pubkey) {
+		shell_print(sh, "  Noise Key (X25519):");
+		for (int j = 0; j < 32; j += 16) {
+			shell_print(sh, "    %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+			           peer_cache[i].noise_pubkey[j+0], peer_cache[i].noise_pubkey[j+1],
 				           peer_cache[i].sign_pubkey[j+8], peer_cache[i].sign_pubkey[j+9],
 				           peer_cache[i].sign_pubkey[j+10], peer_cache[i].sign_pubkey[j+11],
 				           peer_cache[i].sign_pubkey[j+12], peer_cache[i].sign_pubkey[j+13],
