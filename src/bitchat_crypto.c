@@ -14,6 +14,9 @@
 
 LOG_MODULE_REGISTER(bitchat_crypto, LOG_LEVEL_INF);
 
+/* External mutex for serializing UART output (defined in main.c) */
+extern struct k_mutex uart_mutex;
+
 #define NOISE_PROTOCOL_NAME "Noise_XX_25519_ChaChaPoly_SHA256"
 
 /* ========== Key Generation ========== */
@@ -315,8 +318,10 @@ int noise_init_session(struct noise_session *session, bool initiator,
 	session->session_id = sys_rand16_get();
 	session->last_activity = k_uptime_get();
 	
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Noise session initialized (ID: 0x%04x, %s)", 
 	        session->session_id, initiator ? "initiator" : "responder");
+	k_mutex_unlock(&uart_mutex);
 	
 	return 0;
 }
@@ -339,7 +344,9 @@ int noise_handshake_write_message1(struct noise_session *session, uint8_t *out, 
 	noise_mix_hash(session->h, session->e_public, NOISE_KEY_SIZE);
 	
 	session->state = NOISE_SENT_E;
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Sent handshake message 1 (e)");
+	k_mutex_unlock(&uart_mutex);
 	
 	return 0;
 }
@@ -364,7 +371,9 @@ int noise_handshake_read_message1(struct noise_session *session, const uint8_t *
 	noise_mix_hash(session->h, session->remote_e, NOISE_KEY_SIZE);
 	
 	session->state = NOISE_SENT_E;  /* Ready to send message 2 */
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Received handshake message 1 (e)");
+	k_mutex_unlock(&uart_mutex);
 	
 	return 0;
 }
@@ -419,7 +428,9 @@ int noise_handshake_write_message2(struct noise_session *session,
 	
 	*out_len = offset;
 	session->state = NOISE_RECEIVED_EES_S_ES;
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Sent handshake message 2 (e, ee, s, es)");
+	k_mutex_unlock(&uart_mutex);
 	
 	return 0;
 }
@@ -477,7 +488,9 @@ int noise_handshake_read_message2(struct noise_session *session,
 	noise_mix_key(session->ck, NULL, dh_result, NOISE_KEY_SIZE);
 	
 	session->state = NOISE_RECEIVED_EES_S_ES;
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Received handshake message 2 (e, ee, s, es)");
+	k_mutex_unlock(&uart_mutex);
 	
 	return 0;
 }
@@ -528,7 +541,9 @@ int noise_handshake_write_message3(struct noise_session *session,
 	session->rx_nonce = 0;
 	session->state = NOISE_TRANSPORT;
 	
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Sent handshake message 3 (s, se) - transport mode");
+	k_mutex_unlock(&uart_mutex);
 	
 	return 0;
 }
@@ -579,7 +594,9 @@ int noise_handshake_read_message3(struct noise_session *session,
 	session->rx_nonce = 0;
 	session->state = NOISE_TRANSPORT;
 	
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Received handshake message 3 (s, se) - transport mode");
+	k_mutex_unlock(&uart_mutex);
 	
 	return 0;
 }
@@ -651,7 +668,9 @@ int noise_complete_ephemeral_handshake(struct noise_session *session, const uint
 		return -1;
 	}
 	
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Completing ephemeral-only handshake (32-byte RESP mode)");
+	k_mutex_unlock(&uart_mutex);
 	
 	/* Store remote ephemeral key */
 	memcpy(session->remote_e, remote_ephemeral, NOISE_KEY_SIZE);
@@ -705,8 +724,10 @@ int noise_complete_ephemeral_handshake(struct noise_session *session, const uint
 	memset(temp_k2, 0, sizeof(temp_k2));
 	memset(session->e_private, 0, NOISE_KEY_SIZE); /* Clear ephemeral private key */
 	
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Ephemeral-only handshake complete - TRANSPORT MODE ACTIVE");
 	LOG_WRN("No static key authentication - forward secrecy only");
+	k_mutex_unlock(&uart_mutex);
 	
 	return 0;
 }
@@ -715,7 +736,9 @@ int noise_complete_ephemeral_handshake(struct noise_session *session, const uint
 
 int bitchat_init_identity(struct bitchat_identity *id, const char *nickname)
 {
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Initializing bitchat identity...");
+	k_mutex_unlock(&uart_mutex);
 	
 	if (bitchat_generate_keypair(id->noise_private, id->noise_public) != 0) {
 		LOG_ERR("Failed to generate Noise keypair");
@@ -730,10 +753,12 @@ int bitchat_init_identity(struct bitchat_identity *id, const char *nickname)
 	strncpy(id->nickname, nickname, bitchat_NICKNAME_LEN - 1);
 	id->nickname[bitchat_NICKNAME_LEN - 1] = '\0';
 	
+	k_mutex_lock(&uart_mutex, K_FOREVER);
 	LOG_INF("Identity: %s", id->nickname);
 	LOG_INF("  Noise pub: %02x%02x...%02x%02x", 
 	        id->noise_public[0], id->noise_public[1],
 	        id->noise_public[30], id->noise_public[31]);
+	k_mutex_unlock(&uart_mutex);
 	
 	return 0;
 }

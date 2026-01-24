@@ -1,7 +1,4 @@
-/* ESP32-C6 bitchat IRC Client
- * Protocol: Noise_XX_25519_ChaChaPoly_SHA256
- * Full mesh P2P messaging over BLE with IRC-style interface
- */
+/* bitchat-esp32 - implementation of Bitchat on ESP32-C6 */
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/sys/printk.h>
@@ -17,9 +14,7 @@
 #include <zephyr/random/random.h>
 #include <psa/crypto.h>
 #include <stdlib.h>
-
 #include <string.h>
-
 #include "bitchat_protocol.h"
 
 LOG_MODULE_REGISTER(bitchat, LOG_LEVEL_INF);
@@ -37,6 +32,7 @@ K_MUTEX_DEFINE(uart_mutex);
 /* Forward declarations for globals used by prompt functions */
 static struct bitchat_identity local_identity;
 static char current_channel[32] = "#bluetooth";  /* Default BLE mesh channel */
+static uint8_t current_channel_hash[32];  /* Nostr channel hash = SHA256(geohash + channel) */
 
 /* Crypto function prototypes */
 extern int bitchat_init_identity(struct bitchat_identity *id, const char *nickname);
@@ -133,6 +129,31 @@ struct tx_debug_work {
 };
 
 static struct tx_debug_work tx_debug_work_item;
+
+/* Work structure for ALL packet processing (offload from system thread to ble_workq) */
+struct packet_process_work {
+	struct k_work work;
+	struct bt_conn *conn;
+	uint8_t packet_data[DEBUG_BUFFER_SIZE];
+	uint16_t packet_len;
+};
+
+static struct packet_process_work packet_work_item;
+
+/* Work structure for handshake processing (offload from system thread to ble_workq) */
+struct handshake_process_work {
+	struct k_work work;
+	struct bt_conn *conn;
+	uint64_t sender_id;
+	uint8_t handshake_type;  /* bitchat_TLV_NOISE_INIT, RESP, or FINISH */
+	uint8_t handshake_data[256];
+	uint16_t handshake_len;
+	char nickname[bitchat_NICKNAME_LEN];
+	char channel[32];
+	bool has_channel;
+};
+
+static struct handshake_process_work handshake_work_item;
 
 /* Work structure for sending messages (must run in ble_workq for GATT writes) */
 #define MAX_SEND_MESSAGE_LEN 256
@@ -278,12 +299,17 @@ static void derive_geohash_identity(const char *channel, uint8_t *channel_hash_o
 		hash_str = "bluetooth";
 	}
 	
-	/* Channel hash = first 32 bytes of geohash string (padded with zeros) */
+	/* Channel hash = SHA256(geohash_string + channel_name)
+	 * This creates a deterministic hash for channel identification */
+	uint8_t channel_input[256];
+	size_t ch_offset = 0;
 	size_t hash_len = strlen(hash_str);
-	memset(channel_hash_out, 0, 32);
-	for (size_t i = 0; i < hash_len && i < 32; i++) {
-		channel_hash_out[i] = hash_str[i];
-	}
+	memcpy(channel_input + ch_offset, hash_str, hash_len);
+	ch_offset += hash_len;
+	size_t channel_len = strlen(channel);
+	memcpy(channel_input + ch_offset, channel, channel_len);
+	ch_offset += channel_len;
+	bitchat_sha256(channel_input, ch_offset, channel_hash_out);
 	
 	/* Identity = SHA256(geohash || channel || private_key) */
 	uint8_t combined[256];
@@ -295,7 +321,6 @@ static void derive_geohash_identity(const char *channel, uint8_t *channel_hash_o
 	offset += geohash_len;
 	
 	/* Add channel name */
-	size_t channel_len = strlen(channel);
 	memcpy(combined + offset, channel, channel_len);
 	offset += channel_len;
 	
@@ -512,13 +537,10 @@ static uint16_t bitchat_serialize_packet(const struct bitchat_packet *pkt, uint8
 	/* Calculate data length before padding */
 	uint16_t data_len = ptr - buffer;
 	
-	/* Add padding only for encrypted packets (hide ciphertext length)
-	 * Plaintext packets don't need padding - saves bandwidth */
-	uint16_t padded_size;
-	if (pkt->header.type & 0x20) {  /* Encrypted flag */
-		padded_size = bitchat_pad_packet(buffer, data_len, buffer_size);
-	} else {
-		padded_size = data_len;  /* No padding for plaintext */
+	/* Always pad packets to hide true message length (privacy feature) */
+	uint16_t padded_size = bitchat_pad_packet(buffer, data_len, buffer_size);
+	if (padded_size == 0) {
+		return data_len;  /* Padding failed, send unpadded */
 	}
 	
 	return padded_size;
@@ -1216,7 +1238,7 @@ static ssize_t on_message_received(struct bt_conn *conn,
 	/* Parse header (14 bytes) */
 	uint8_t type = ptr[1];
 	uint8_t ttl = ptr[2];
-	(void)ttl;  /* Gossip relay handled in notify_func */
+	(void)ttl;  // Gossip relay TTL 
 	uint64_t timestamp_be;
 	memcpy(&timestamp_be, ptr + 3, 8);
 	uint8_t msg_flags = ptr[11];
@@ -1247,7 +1269,7 @@ static ssize_t on_message_received(struct bt_conn *conn,
 		/* Don't display here - notifications handle all incoming messages
 		 * This handler is for writes TO our characteristic, not FROM peers */
 		
-		/* Gossip/relay is now handled in notify_func for efficiency */
+		/* Gossip/relay is now handled in worker thread */
 	} else if (type != bitchat_PKT_MESSAGE) {
 		/* Encrypted or handshake - already logged by notify_func */
 	}
@@ -1543,371 +1565,171 @@ static uint8_t notify_func(struct bt_conn *conn,
 		return BT_GATT_ITER_STOP;
 	}
 	
-	/* Remove padding from received packet */
-	uint16_t unpadded_len = bitchat_unpad_packet((const uint8_t *)data, length);
-	
-	/* Offload dissection to worker thread if debug enabled (avoid blocking callback) */
-	/* Only submit if not already pending to avoid data corruption */
-	if (debug_enabled && unpadded_len <= DEBUG_BUFFER_SIZE) {
+	/* Offload dissection to worker thread if debug enabled - BEFORE stripping padding */
+	if (debug_enabled && length <= DEBUG_BUFFER_SIZE) {
 		if (k_work_busy_get(&debug_work_item.work) == 0) {
-			memcpy(debug_work_item.packet_data, data, unpadded_len);
-			debug_work_item.packet_len = unpadded_len;
+			memcpy(debug_work_item.packet_data, data, length);
+			debug_work_item.packet_len = length;
 			k_work_submit_to_queue(&ble_workq, &debug_work_item.work);
 		}
 	}
 	
-	/* Parse official bitchat packet format */
-	if (unpadded_len >= 14 + 8) {  /* header + sender_id minimum */
-		const uint8_t *ptr = (const uint8_t *)data;
-		
-		/* Parse header (14 bytes) */
-		uint8_t type = ptr[1];
-		uint8_t ttl = ptr[2];
-		uint8_t flags = ptr[11];
-		uint16_t payload_len_be;
-		memcpy(&payload_len_be, ptr + 12, 2);
-		uint16_t payload_len = sys_be16_to_cpu(payload_len_be);
-		ptr += 14;
-		
-		/* Parse sender_id (8 bytes) */
-		uint64_t sender_id;
-		memcpy(&sender_id, ptr, 8);
-		ptr += 8;
-		
-		/* Optional recipient_id */
-		uint64_t recipient_id = 0;
-		if (flags & bitchat_FLAG_HAS_RECIPIENT) {
-			memcpy(&recipient_id, ptr, 8);
-			ptr += 8;
+	/* Queue ALL packet processing to worker thread - MINIMAL notify_func */
+	if (length <= DEBUG_BUFFER_SIZE) {
+		if (k_work_busy_get(&packet_work_item.work) == 0) {
+			packet_work_item.conn = conn;
+			memcpy(packet_work_item.packet_data, data, length);
+			packet_work_item.packet_len = length;
+			k_work_submit_to_queue(&ble_workq, &packet_work_item.work);
 		}
+	}
+	// over-complicate this function results in timeouts and blocks the system thread.
+	return BT_GATT_ITER_CONTINUE;
+}
+
+/* Work handler for packet processing - runs ALL logic in ble_workq */
+static void packet_process_work_handler(struct k_work *work)
+{
+	struct packet_process_work *pw = CONTAINER_OF(work, struct packet_process_work, work);
+	struct bt_conn *conn = pw->conn;
+	
+	if (!conn) {
+		return;
+	}
+	
+	/* Remove padding from received packet (debug dissector already saw padded version) */
+	uint16_t unpadded_len = bitchat_unpad_packet(pw->packet_data, pw->packet_len);
+	
+	if (unpadded_len < 14 + 8) {
+		return;  /* Too short */
+	}
+	
+	const uint8_t *ptr = pw->packet_data;
+	uint8_t type = ptr[1];
+	uint8_t ttl = ptr[2];
+	uint8_t flags = ptr[11];
+	uint16_t payload_len_be;
+	memcpy(&payload_len_be, ptr + 12, 2);
+	uint16_t payload_len = sys_be16_to_cpu(payload_len_be);
+	ptr += 14;
+	
+	/* Parse sender_id (8 bytes) */
+	uint64_t sender_id;
+	memcpy(&sender_id, ptr, 8);
+	ptr += 8;
+	
+	/* Optional recipient_id */
+	uint64_t recipient_id = 0;
+	if (flags & bitchat_FLAG_HAS_RECIPIENT) {
+		memcpy(&recipient_id, ptr, 8);
+		ptr += 8;
+	}
+	
+	/* Duplicate detection using unpadded packet */
+	uint32_t packet_hash = simple_hash(pw->packet_data, unpadded_len);
+	if (bitchat_is_duplicate(packet_hash)) {
+		return;  /* Duplicate - drop silently */
+	}
+	bitchat_cache_message(packet_hash);
+	
+	/* === HANDLE MESSAGE PACKETS (0x01) === */
+	if (type == bitchat_PKT_MESSAGE && payload_len > 0 && payload_len < MAX_MESSAGE_LEN) {
 		
-		/* === HANDLE MESSAGE PACKETS (0x01) === */
-		if (type == bitchat_PKT_MESSAGE && payload_len > 0 && payload_len < MAX_MESSAGE_LEN) {
+		/* Check if this is TLV-encoded */
+		if (is_tlv_handshake(ptr, payload_len)) {
+			/* Parse TLV payload */
+			struct tlv_message tlv_msg;
+			parse_tlv_payload(ptr, payload_len, &tlv_msg);
 			
-			/* Check if this is TLV-encoded */
-			if (is_tlv_handshake(ptr, payload_len)) {
-				/* Parse TLV payload using helper function */
-				struct tlv_message tlv_msg;
-				parse_tlv_payload(ptr, payload_len, &tlv_msg);
-				
-				/* Store nickname if present */
-				if (tlv_msg.has_nickname) {
-					store_nickname(sender_id, tlv_msg.nickname);
-				}
-				
-				/* === HANDLE TEXT MESSAGES === */
-				/* Mobile clients send text messages as TLV with NICKNAME + CHANNEL + TEXT */
-				if (tlv_msg.has_text && !tlv_msg.has_handshake) {
-					const char *nick = tlv_msg.has_nickname ? tlv_msg.nickname : get_nickname(sender_id);
-					const char *channel = tlv_msg.has_channel ? tlv_msg.channel : current_channel;
-					
-					char from_str[80];
-					if (nick) {
-						snprintf(from_str, sizeof(from_str), "%s 0x%llx (%s)", 
-						         channel, (unsigned long long)sender_id, nick);
-					} else {
-						snprintf(from_str, sizeof(from_str), "%s 0x%llx", 
-						         channel, (unsigned long long)sender_id);
-					}
-					
-					printk("[MSG] %s: %s\n", from_str, tlv_msg.text);
-					display_message(from_str, tlv_msg.text);
-					messages_received++;
-					
-					return BT_GATT_ITER_CONTINUE;
-				}
-				
-				/* Check if this is a geohash broadcast (NOT a handshake) */
-				if (is_geohash_broadcast(&tlv_msg)) {
-					/* Handle geohash identity broadcast */
-					handle_geohash_broadcast(&tlv_msg, sender_id);
-					
-					/* Track peer FIRST so they appear in list command */
-					add_or_update_peer(sender_id, tlv_msg.nickname,
-					                  tlv_msg.has_channel ? tlv_msg.channel : "#bluetooth",
-					                  bt_conn_get_dst(conn),
-					                  tlv_msg.handshake_data,
-					                  NULL,
-					                  true);
-					
-					/* DO NOT process as Noise handshake - just continue */
-					return BT_GATT_ITER_CONTINUE;
-				}
-				
-				/* === THIS IS A REAL NOISE HANDSHAKE === */
-				
-				/* Determine handshake phase name for display */
-				const char *hs_name = "UNKNOWN";
-				if (tlv_msg.handshake_type == bitchat_TLV_NOISE_INIT) {
-					hs_name = "INIT";
-				} else if (tlv_msg.handshake_type == bitchat_TLV_NOISE_RESP) {
-					hs_name = "RESP";
-				} else if (tlv_msg.handshake_type == bitchat_TLV_NOISE_FINISH) {
-					hs_name = "FINISH";
-				}
-				
-			/* Always show basic handshake info (matching working commit behavior) */
-			printk("[RX] Noise handshake %s from 0x%llx (%s@%s) len=%u\n",
-			       hs_name, (unsigned long long)sender_id,
-			       tlv_msg.nickname, tlv_msg.has_channel ? tlv_msg.channel : "?",
-			       tlv_msg.handshake_len);
-			
-			/* Show hex dump only in debug mode */
-			if (debug_enabled) {
-				printk("  Key material (hex): ");
-				for (uint16_t i = 0; i < tlv_msg.handshake_len && i < 80; i++) {
-					printk("%02x", tlv_msg.handshake_data[i]);
-				}
-				if (tlv_msg.handshake_len > 80) {
-					printk("...");
-				}
-				printk("\n");
+			/* Store nickname if present */
+			if (tlv_msg.has_nickname) {
+				store_nickname(sender_id, tlv_msg.nickname);
 			}
 			
-			/* Track peer (store ephemeral key from handshake) */
-			add_or_update_peer(sender_id, tlv_msg.nickname,
-			                  tlv_msg.has_channel ? tlv_msg.channel : NULL,
-			                  bt_conn_get_dst(conn),
-			                  tlv_msg.handshake_data,  /* ephemeral or encrypted key */
-			                  NULL,  /* sign key not extractable from encrypted payload */
-			                  true);  /* connected */
-			
-			if (debug_enabled) {
-				printk("  [Peer] Added %s from %s\n", hs_name, tlv_msg.nickname);
-			}
-			
-			/* === PROCESS HANDSHAKE (unless in stealth mode) === */
-			
-			if (stealth_mode) {
-				if (debug_enabled) {
-					printk("  [Stealth] Ignoring handshake\n");
-				}
-				/* Continue listening for more packets */
-				return BT_GATT_ITER_CONTINUE;
-			}
-			
-			/* Get or create Noise session */
-			struct noise_session *session = get_session(conn);
-			int conn_idx = get_conn_index(conn);
+			/* === HANDLE TEXT MESSAGES === */
+			if (tlv_msg.has_text && !tlv_msg.has_handshake) {
+				const char *nick = tlv_msg.has_nickname ? tlv_msg.nickname : get_nickname(sender_id);
+				const char *channel = tlv_msg.has_channel ? tlv_msg.channel : current_channel;
 				
-				/* === HANDLE NOISE INIT === */
-				if (tlv_msg.handshake_type == bitchat_TLV_NOISE_INIT && tlv_msg.handshake_len >= 32) {
-					
-					/* Initialize responder session if needed */
-					if (!session) {
-						if (init_session_for_conn(conn, false) == 0) {
-							session = get_session(conn);
-						}
-					}
-					
-					/* Process message 1 (INIT) */
-					if (session && noise_handshake_read_message1(session, tlv_msg.handshake_data, 
-					                                             tlv_msg.handshake_len) == 0) {
-						
-						/* Generate message 2 (RESP) */
-						uint8_t msg2[NOISE_KEY_SIZE * 2 + 16];
-						size_t msg2_len;
-						
-						if (noise_handshake_write_message2(session, &local_identity, msg2, &msg2_len) == 0) {
-							/* Build TLV response: NICKNAME + CHANNEL + NOISE_RESP */
-							uint8_t tlv_payload[256];
-							uint8_t *tlv_ptr = tlv_payload;
-							
-							/* TLV: Nickname */
-							*tlv_ptr++ = bitchat_TLV_NICKNAME;
-							*tlv_ptr++ = strlen(local_identity.nickname);
-							memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
-							tlv_ptr += strlen(local_identity.nickname);
-							
-							/* TLV: Channel */
-							*tlv_ptr++ = bitchat_TLV_CHANNEL;
-							*tlv_ptr++ = strlen(current_channel);
-							memcpy(tlv_ptr, current_channel, strlen(current_channel));
-							tlv_ptr += strlen(current_channel);
-							
-							/* TLV: NOISE_RESP */
-							*tlv_ptr++ = bitchat_TLV_NOISE_RESP;
-							*tlv_ptr++ = msg2_len;
-							memcpy(tlv_ptr, msg2, msg2_len);
-							tlv_ptr += msg2_len;
-							
-							uint16_t total_len = tlv_ptr - tlv_payload;
-							
-							/* Send MESSAGE packet with TLV */
-							struct bitchat_packet pkt;
-							if (bitchat_create_packet(&pkt, bitchat_PKT_MESSAGE, 
-							                           bitchat_MAX_TTL, 
-							                           tlv_payload, total_len) == 0) {
-								if (conn_idx >= 0) {
-									bitchat_send_packet(conn, remote_handles[conn_idx], &pkt);
-									printk("[TX] Sent RESP (80 bytes)\n");
-								}
-							}
-						}
-					}
-				}
-				/* === HANDLE NOISE RESP === */
-				else if (tlv_msg.handshake_type == bitchat_TLV_NOISE_RESP && tlv_msg.handshake_len >= 32) {
-					
-					/* Valid 80-byte RESP to our INIT */
-					if (session && session->state == NOISE_SENT_E && tlv_msg.handshake_len >= 80) {
-						
-						/* Process message 2 (RESP) */
-						if (noise_handshake_read_message2(session, &local_identity, 
-						                                 tlv_msg.handshake_data, tlv_msg.handshake_len) == 0) {
-							
-							/* Generate message 3 (FINISH) */
-							uint8_t msg3[NOISE_KEY_SIZE];
-							size_t msg3_len;
-							
-							if (noise_handshake_write_message3(session, &local_identity, msg3, &msg3_len) == 0) {
-								/* Build TLV response: NICKNAME + CHANNEL + NOISE_FINISH */
-								uint8_t tlv_payload[256];
-								uint8_t *tlv_ptr = tlv_payload;
-								
-								/* TLV: Nickname */
-								*tlv_ptr++ = bitchat_TLV_NICKNAME;
-								*tlv_ptr++ = strlen(local_identity.nickname);
-								memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
-								tlv_ptr += strlen(local_identity.nickname);
-								
-								/* TLV: Channel */
-								*tlv_ptr++ = bitchat_TLV_CHANNEL;
-								*tlv_ptr++ = strlen(current_channel);
-								memcpy(tlv_ptr, current_channel, strlen(current_channel));
-								tlv_ptr += strlen(current_channel);
-								
-								/* TLV: NOISE_FINISH */
-								*tlv_ptr++ = bitchat_TLV_NOISE_FINISH;
-								*tlv_ptr++ = msg3_len;
-								memcpy(tlv_ptr, msg3, msg3_len);
-								tlv_ptr += msg3_len;
-								
-								uint16_t total_len = tlv_ptr - tlv_payload;
-								
-								/* Send MESSAGE packet with TLV */
-								struct bitchat_packet pkt;
-								if (bitchat_create_packet(&pkt, bitchat_PKT_MESSAGE,
-								                           bitchat_MAX_TTL,
-								                           tlv_payload, total_len) == 0) {
-									if (conn_idx >= 0) {
-										bitchat_send_packet(conn, remote_handles[conn_idx], &pkt);
-										printk("[TX] Sent FINISH - TRANSPORT MODE ACTIVE\n");
-									}
-								}
-							}
-						}
-					}
-				}
-				/* 32-byte "RESP" is actually INIT (peer mislabeled or collision occurred) */
-				else if (tlv_msg.handshake_len == 32) {
-					printk("[Noise] Peer sent 32-byte RESP (actually INIT) - collision detected\n");
-					
-					/* ALWAYS reinitialize as responder (even if session exists) to handle collision */
-					if (init_session_for_conn(conn, false) == 0) {
-						session = get_session(conn);
-						printk("[Noise] Reinitialized session as responder for collision resolution\n");
-					}
-					
-					/* Process as message 1 (INIT) */
-					if (session && noise_handshake_read_message1(session, tlv_msg.handshake_data, 
-					                                             tlv_msg.handshake_len) == 0) {
-						
-						/* Generate message 2 (RESP) */
-						uint8_t msg2[NOISE_KEY_SIZE * 2 + 16];
-						size_t msg2_len;
-						
-						if (noise_handshake_write_message2(session, &local_identity, msg2, &msg2_len) == 0) {
-							/* Build TLV response */
-							uint8_t tlv_payload[256];
-							uint8_t *tlv_ptr = tlv_payload;
-							
-							*tlv_ptr++ = bitchat_TLV_NICKNAME;
-							*tlv_ptr++ = strlen(local_identity.nickname);
-							memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
-							tlv_ptr += strlen(local_identity.nickname);
-							
-							*tlv_ptr++ = bitchat_TLV_CHANNEL;
-							*tlv_ptr++ = strlen(current_channel);
-							memcpy(tlv_ptr, current_channel, strlen(current_channel));
-							tlv_ptr += strlen(current_channel);
-							
-							*tlv_ptr++ = bitchat_TLV_NOISE_RESP;
-							*tlv_ptr++ = msg2_len;
-							memcpy(tlv_ptr, msg2, msg2_len);
-							tlv_ptr += msg2_len;
-							
-							uint16_t total_len = tlv_ptr - tlv_payload;
-							
-							struct bitchat_packet pkt;
-							if (bitchat_create_packet(&pkt, bitchat_PKT_MESSAGE, 
-							                           bitchat_MAX_TTL, 
-							                           tlv_payload, total_len) == 0) {
-								if (conn_idx >= 0) {
-									bitchat_send_packet(conn, remote_handles[conn_idx], &pkt);
-									printk("[TX] Sent RESP (to mislabeled INIT)\n");
-								}
-							}
-						}
-					}
-				}
-				/* === HANDLE NOISE FINISH === */
-				else if (tlv_msg.handshake_type == bitchat_TLV_NOISE_FINISH && tlv_msg.handshake_len >= 32) {
-					
-					/* Process message 3 (FINISH) */
-					if (session && noise_handshake_read_message3(session, tlv_msg.handshake_data, 
-					                                             tlv_msg.handshake_len) == 0) {
-						printk("[Handshake] TRANSPORT MODE ACTIVE\n");
-					}
-				}
-				
-				messages_received++;
-				
-			} else {
-				/* === REGULAR TEXT MESSAGE (no TLV) === */
-				
-				char msg[MAX_MESSAGE_LEN + 1];
-				memcpy(msg, ptr, payload_len);
-				msg[payload_len] = '\0';
-				
-				/* Extract nickname from "nickname message" format */
-				char *space = strchr(msg, ' ');
-				if (space && (space - msg) < bitchat_NICKNAME_LEN) {
-					char nickname[bitchat_NICKNAME_LEN];
-					size_t nick_len = space - msg;
-					memcpy(nickname, msg, nick_len);
-					nickname[nick_len] = '\0';
-					store_nickname(sender_id, nickname);
-				}
-				
-				/* Format and display message */
-				const char *nick = get_nickname(sender_id);
 				char from_str[80];
 				if (nick) {
-					snprintf(from_str, sizeof(from_str), "#mesh 0x%llx (%s)", 
-					         (unsigned long long)sender_id, nick);
+					snprintf(from_str, sizeof(from_str), "%s 0x%llx (%s)", 
+					         channel, (unsigned long long)sender_id, nick);
 				} else {
-					snprintf(from_str, sizeof(from_str), "#mesh 0x%llx", 
-					         (unsigned long long)sender_id);
+					snprintf(from_str, sizeof(from_str), "%s 0x%llx", 
+					         channel, (unsigned long long)sender_id);
 				}
 				
-				printk("[MSG] %s: %s\n", from_str, msg);
-				display_message(from_str, msg);
+				k_mutex_lock(&uart_mutex, K_FOREVER);
+				printk("[MSG] %s: %s\n", from_str, tlv_msg.text);
+				k_mutex_unlock(&uart_mutex);
+				
+				display_message(from_str, tlv_msg.text);
 				messages_received++;
+				
+				return;
 			}
-		}
-		/* === HANDLE ACK/RECEIPT PACKETS === */
-		/* Android BitChat uses DELIVERY_ACK (0x02) for broadcast messages in Nostr protocol */
-		else if ((type == bitchat_PKT_DELIVERY_ACK || type == bitchat_PKT_READ_RECEIPT) && 
-		         payload_len > 0 && payload_len < MAX_MESSAGE_LEN) {
 			
+			/* Check if this is a geohash broadcast (NOT a handshake) */
+			if (is_geohash_broadcast(&tlv_msg)) {
+				handle_geohash_broadcast(&tlv_msg, sender_id);
+				
+				/* Track peer so they appear in list command */
+				add_or_update_peer(sender_id, tlv_msg.nickname,
+				                  tlv_msg.has_channel ? tlv_msg.channel : "#bluetooth",
+				                  bt_conn_get_dst(conn),
+				                  tlv_msg.handshake_data,
+				                  NULL,
+				                  true);
+				
+				return;  /* Don't process as Noise handshake */
+			}
+			
+			/* === OFFLOAD HANDSHAKE PROCESSING TO WORKER === */
+			if (stealth_mode) {
+				return;  /* Silently ignore handshakes in stealth mode */
+			}
+			
+			/* Queue handshake for processing in ble_workq */
+			if (k_work_busy_get(&handshake_work_item.work) == 0) {
+				handshake_work_item.conn = conn;
+				handshake_work_item.sender_id = sender_id;
+				handshake_work_item.handshake_type = tlv_msg.handshake_type;
+				handshake_work_item.handshake_len = tlv_msg.handshake_len;
+				memcpy(handshake_work_item.handshake_data, tlv_msg.handshake_data, 
+				       tlv_msg.handshake_len < sizeof(handshake_work_item.handshake_data) ? 
+				       tlv_msg.handshake_len : sizeof(handshake_work_item.handshake_data));
+				
+				if (tlv_msg.has_nickname) {
+					strncpy(handshake_work_item.nickname, tlv_msg.nickname, 
+					        sizeof(handshake_work_item.nickname) - 1);
+					handshake_work_item.nickname[sizeof(handshake_work_item.nickname) - 1] = '\0';
+				} else {
+					handshake_work_item.nickname[0] = '\0';
+				}
+				
+				if (tlv_msg.has_channel) {
+					strncpy(handshake_work_item.channel, tlv_msg.channel, 
+					        sizeof(handshake_work_item.channel) - 1);
+					handshake_work_item.channel[sizeof(handshake_work_item.channel) - 1] = '\0';
+					handshake_work_item.has_channel = true;
+				} else {
+					handshake_work_item.has_channel = false;
+				}
+				
+				k_work_submit_to_queue(&ble_workq, &handshake_work_item.work);
+			}
+			
+			messages_received++;
+			
+		} else {
+			/* === REGULAR TEXT MESSAGE (no TLV) === */
 			char msg[MAX_MESSAGE_LEN + 1];
 			memcpy(msg, ptr, payload_len);
 			msg[payload_len] = '\0';
 			
 			const char *nick = get_nickname(sender_id);
 			
-			/* Lock UART for atomic log output */
 			k_mutex_lock(&uart_mutex, K_FOREVER);
 			if (nick) {
 				printk("[MSG] #bluetooth 0x%llx (%s): %s\n", 
@@ -1918,204 +1740,116 @@ static uint8_t notify_func(struct bt_conn *conn,
 			}
 			k_mutex_unlock(&uart_mutex);
 			
-			/* Display in message history */
 			char from_str[80];
 			if (nick) {
 				snprintf(from_str, sizeof(from_str), "#bluetooth (%s)", nick);
 			} else {
-				snprintf(from_str, sizeof(from_str), "#bluetooth 0x%llx", 
+				snprintf(from_str, sizeof(from_str), "#bluetooth (0x%llx)", 
 				         (unsigned long long)sender_id);
 			}
 			display_message(from_str, msg);
 			messages_received++;
 		}
-		/* === HANDLE LEGACY NOISE HANDSHAKE PACKETS (0x10) === */
-		else if (type == bitchat_PKT_NOISE_HANDSHAKE) {
-			
-			const char *nick = get_nickname(sender_id);
-			struct noise_session *session = get_session(conn);
-
-			if (!session) {
-				if (debug_enabled) {
-					printk("[RX] Noise INIT from 0x%llx (%s) len=%u\n", 
-					       (unsigned long long)sender_id, nick ? nick : "?", payload_len);
-					
-					printk("  Ephemeral key: ");
-					for (uint16_t i = 0; i < payload_len && i < 32; i++) {
-						printk("%02x", ptr[i]);
-					}
-					if (payload_len > 32) printk("...");
-					printk("\n");
-				}
-				
-				if (stealth_mode) {
-					if (debug_enabled) {
-						printk("  [Stealth] Ignoring\n");
-					}
-				} else {
-					/* Initialize responder session */
-					if (init_session_for_conn(conn, false) == 0) {
-						session = get_session(conn);
-						if (noise_handshake_read_message1(session, ptr, payload_len) == 0) {
-							/* Send RESP */
-							uint8_t msg2[NOISE_KEY_SIZE * 2 + 16];
-							size_t msg2_len;
-							if (noise_handshake_write_message2(session, &local_identity, 
-							                                   msg2, &msg2_len) == 0) {
-								send_handshake_packet(conn, bitchat_PKT_NOISE_HANDSHAKE,
-								                      msg2, msg2_len);
-								printk("[TX] Sent RESP\n");
-							}
-						}
-					}
-				}
-			}
-			/* State = SENT_E = RESP */
-			else if (session->state == NOISE_SENT_E) {
-				if (debug_enabled) {
-					printk("[RX] Noise RESP from 0x%llx (%s) len=%u\n", 
-					       (unsigned long long)sender_id, nick ? nick : "?", payload_len);
-					
-					printk("  Key material: ");
-					for (uint16_t i = 0; i < payload_len && i < 64; i++) {
-						printk("%02x", ptr[i]);
-					}
-					if (payload_len > 64) printk("...");
-					printk("\n");
-				}
-				
-				if (noise_handshake_read_message2(session, &local_identity, ptr, payload_len) == 0) {
-					/* Send FINISH */
-					uint8_t msg3[NOISE_KEY_SIZE];
-					size_t msg3_len;
-					if (noise_handshake_write_message3(session, &local_identity, 
-					                                   msg3, &msg3_len) == 0) {
-						send_handshake_packet(conn, bitchat_PKT_NOISE_HANDSHAKE,
-						                      msg3, msg3_len);
-						printk("[TX] Sent FINISH - TRANSPORT MODE ACTIVE\n");
-					}
-				}
-			}
-			/* State = RECEIVED_EES_S_ES = FINISH */
-			else if (session->state == NOISE_RECEIVED_EES_S_ES) {
-				if (debug_enabled) {
-					printk("[RX] Noise FINISH from 0x%llx (%s) len=%u\n", 
-					       (unsigned long long)sender_id, nick ? nick : "?", payload_len);
-					
-					printk("  Static key: ");
-					for (uint16_t i = 0; i < payload_len && i < 64; i++) {
-						printk("%02x", ptr[i]);
-					}
-					if (payload_len > 64) printk("...");
-					printk("\n");
-				}
-				
-				if (noise_handshake_read_message3(session, ptr, payload_len) == 0) {
-					printk("[Handshake] TRANSPORT MODE ACTIVE\n");
-				}
-			}
-			else {
-				printk("[RX] Unexpected handshake in state %d\n", session->state);
-			}
-		}
-		/* === HANDLE ENCRYPTED/UNKNOWN PACKETS === */
-		else {
-			struct noise_session *session = get_session(conn);
-			
-			/* Try to decrypt if we have an active transport session */
-			if (session && session->state == NOISE_TRANSPORT && type >= 0x20) {
-				
-				uint8_t plaintext[MAX_MESSAGE_LEN];
-				size_t plaintext_len;
-				
-				if (noise_transport_decrypt(session, ptr, payload_len,
-				                           plaintext, &plaintext_len) == 0) {
-					
-					/* Decryption successful */
-					char msg[MAX_MESSAGE_LEN + 1];
-					memcpy(msg, plaintext, plaintext_len);
-					msg[plaintext_len] = '\0';
-					
-					/* Extract nickname */
-					char *space = strchr(msg, ' ');
-					if (space && (space - msg) < bitchat_NICKNAME_LEN) {
-						char nickname[bitchat_NICKNAME_LEN];
-						size_t nick_len = space - msg;
-						memcpy(nickname, msg, nick_len);
-						nickname[nick_len] = '\0';
-						store_nickname(sender_id, nickname);
-					}
-					
-					const char *nick = get_nickname(sender_id);
-					char from_str[80];
-					if (nick) {
-						snprintf(from_str, sizeof(from_str), "#mesh 0x%llx (%s)", 
-						         (unsigned long long)sender_id, nick);
-					} else {
-						snprintf(from_str, sizeof(from_str), "#mesh 0x%llx", 
-						         (unsigned long long)sender_id);
-					}
-					
-					printk("[MSG] [ENCRYPTED] %s: %s\n", from_str, msg);
-					display_message(from_str, msg);
-					messages_received++;
-				} else {
-					/* Decryption failed */
-					printk("[RX] Encrypted type=%u len=%u from 0x%llx (decrypt failed)\n", 
-					       type, payload_len, (unsigned long long)sender_id);
-				}
-			} else {
-				/* Can't decrypt - show hex dump */
-				printk("[RX] Encrypted type=%u len=%u from 0x%llx\n", 
-				       type, payload_len, (unsigned long long)sender_id);
-				printk("  Hex: ");
-				for (uint16_t i = 0; i < payload_len && i < 32; i++) {
-					printk("%02x", ptr[i]);
-				}
-				if (payload_len > 32) {
-					printk("...");
-				}
-				printk("\n");
-			}
-		}
+	}
+	/* === HANDLE DELIVERY_ACK PACKETS (0x02) === */
+	else if (type == bitchat_PKT_DELIVERY_ACK && payload_len > 0 && payload_len < MAX_MESSAGE_LEN) {
+		/* Android BitChat sends plaintext messages as DELIVERY_ACK */
+		char msg[MAX_MESSAGE_LEN + 1];
+		memcpy(msg, ptr, payload_len);
+		msg[payload_len] = '\0';
 		
-		/* === GOSSIP PROTOCOL: RELAY TO OTHER PEERS === */
-		/* Relay messages to other connected peers if:
-		 * 1. Not in stealth mode (actively participating in mesh)
-		 * 2. TTL > 0 (message can still hop)
-		 * 3. Is a MESSAGE or ACK/RECEIPT packet (not handshakes)
-		 * 4. Have other connections to relay to
-		 */
-		if (!stealth_mode && ttl > 0 && connection_count > 1 &&
-		    (type == bitchat_PKT_MESSAGE || type == bitchat_PKT_DELIVERY_ACK || type == bitchat_PKT_READ_RECEIPT)) {
+		const char *nick = get_nickname(sender_id);
+		
+		k_mutex_lock(&uart_mutex, K_FOREVER);
+		if (nick) {
+			printk("[MSG] #bluetooth 0x%llx (%s): %s\n", 
+			       (unsigned long long)sender_id, nick, msg);
+		} else {
+			printk("[MSG] #bluetooth 0x%llx: %s\n", 
+			       (unsigned long long)sender_id, msg);
+		}
+		k_mutex_unlock(&uart_mutex);
+		
+		char from_str[80];
+		if (nick) {
+			snprintf(from_str, sizeof(from_str), "#bluetooth (%s)", nick);
+		} else {
+			snprintf(from_str, sizeof(from_str), "#bluetooth (0x%llx)", 
+			         (unsigned long long)sender_id);
+		}
+		display_message(from_str, msg);
+		messages_received++;
+	}
+	/* === HANDLE ENCRYPTED/UNKNOWN PACKETS === */
+	else {
+		struct noise_session *session = get_session(conn);
+		
+		/* Try to decrypt if we have an active transport session */
+		if (session && session->state == NOISE_TRANSPORT && type >= 0x20) {
+			uint8_t plaintext[MAX_MESSAGE_LEN];
+			size_t plaintext_len;
 			
-			/* Decrement TTL for relay */
-			uint8_t relay_data[2048];
-			memcpy(relay_data, data, unpadded_len);
-			relay_data[2] = ttl - 1;  /* Decrement TTL at byte offset 2 */
-			
-			/* Relay to all other connections (except source) */
-			int relayed = 0;
-			for (int i = 0; i < connection_count; i++) {
-				if (active_connections[i] && active_connections[i] != conn && connection_ready[i]) {
-					uint16_t handle = remote_handles[i] ? remote_handles[i] : 0x000a;
-					
-					/* Send without response for relay (fire and forget) */
-					int ret = bt_gatt_write_without_response(active_connections[i], handle, 
-					                                         relay_data, unpadded_len, false);
-					if (ret == 0) {
-						relayed++;
-					}
+			if (noise_transport_decrypt(session, ptr, payload_len,
+			                           plaintext, &plaintext_len) == 0) {
+				/* Decryption successful */
+				char msg[MAX_MESSAGE_LEN + 1];
+				memcpy(msg, plaintext, plaintext_len);
+				msg[plaintext_len] = '\0';
+				
+				const char *nick = get_nickname(sender_id);
+				
+				k_mutex_lock(&uart_mutex, K_FOREVER);
+				if (nick) {
+					printk("[MSG] #bluetooth 0x%llx (%s): %s\n", 
+					       (unsigned long long)sender_id, nick, msg);
+				} else {
+					printk("[MSG] #bluetooth 0x%llx: %s\n", 
+					       (unsigned long long)sender_id, msg);
 				}
-			}
-			
-			if (relayed > 0 && debug_enabled) {
-				printk("[GOSSIP] Relayed message to %d peer(s) (TTL now %d)\n", relayed, ttl - 1);
+				k_mutex_unlock(&uart_mutex);
+				
+				char from_str[80];
+				if (nick) {
+					snprintf(from_str, sizeof(from_str), "#bluetooth (%s)", nick);
+				} else {
+					snprintf(from_str, sizeof(from_str), "#bluetooth (0x%llx)", 
+					         (unsigned long long)sender_id);
+				}
+				display_message(from_str, msg);
+				messages_received++;
 			}
 		}
 	}
 	
-	return BT_GATT_ITER_CONTINUE;
+	/* === GOSSIP RELAY TO OTHER PEERS === */
+	if (ttl > 1 && type == bitchat_PKT_MESSAGE && payload_len > 0) {
+		int conn_idx = get_conn_index(conn);
+		int relayed = 0;
+		
+		for (int i = 0; i < CONFIG_BT_MAX_CONN; i++) {
+			if (active_connections[i] && i != conn_idx && connection_ready[i] && remote_handles[i] != 0) {
+				/* Relay with decremented TTL, then re-pad before sending */
+				uint8_t relay_buf[2048];
+				memcpy(relay_buf, pw->packet_data, unpadded_len);
+				relay_buf[2] = ttl - 1;
+				
+				/* Pad packet before transmission */
+				uint16_t padded_len = bitchat_pad_packet(relay_buf, unpadded_len, sizeof(relay_buf));
+				if (padded_len == 0) continue;  /* Padding failed */
+				
+				if (bt_gatt_write_without_response(active_connections[i], remote_handles[i],
+				                                   relay_buf, padded_len, false) == 0) {
+					relayed++;
+				}
+			}
+		}
+		
+		if (relayed > 0 && debug_enabled) {
+			k_mutex_lock(&uart_mutex, K_FOREVER);
+			printk("[GOSSIP] Relayed message to %d peer(s) (TTL now %d)\n", relayed, ttl - 1);
+			k_mutex_unlock(&uart_mutex);
+		}
+	}
 }
 
 /* Work handler for debug dissection - runs in system work queue context */
@@ -2204,6 +1938,256 @@ static void tx_debug_dissect_work_handler(struct k_work *work)
 	k_mutex_unlock(&uart_mutex);
 }
 
+/* Work handler for handshake processing - runs in ble_workq (offload from system thread) */
+static void handshake_process_work_handler(struct k_work *work)
+{
+	struct handshake_process_work *hs_work = CONTAINER_OF(work, struct handshake_process_work, work);
+	struct bt_conn *conn = hs_work->conn;
+	
+	if (!conn) {
+		return;
+	}
+	
+	/* Determine handshake phase name */
+	const char *hs_name = "UNKNOWN";
+	if (hs_work->handshake_type == bitchat_TLV_NOISE_INIT) {
+		hs_name = "INIT";
+	} else if (hs_work->handshake_type == bitchat_TLV_NOISE_RESP) {
+		hs_name = "RESP";
+	} else if (hs_work->handshake_type == bitchat_TLV_NOISE_FINISH) {
+		hs_name = "FINISH";
+	}
+	
+	/* Log handshake reception */
+	k_mutex_lock(&uart_mutex, K_FOREVER);
+	printk("[RX] Noise handshake %s from 0x%llx (%s@%s) len=%u\n",
+	       hs_name, (unsigned long long)hs_work->sender_id,
+	       hs_work->nickname[0] ? hs_work->nickname : "?",
+	       hs_work->has_channel ? hs_work->channel : "?",
+	       hs_work->handshake_len);
+	
+	if (debug_enabled) {
+		printk("  Key material (hex): ");
+		for (uint16_t i = 0; i < hs_work->handshake_len && i < 80; i++) {
+			printk("%02x", hs_work->handshake_data[i]);
+		}
+		if (hs_work->handshake_len > 80) {
+			printk("...");
+		}
+		printk("\n");
+	}
+	k_mutex_unlock(&uart_mutex);
+	
+	/* Track peer */
+	add_or_update_peer(hs_work->sender_id, 
+	                  hs_work->nickname[0] ? hs_work->nickname : NULL,
+	                  hs_work->has_channel ? hs_work->channel : NULL,
+	                  bt_conn_get_dst(conn),
+	                  hs_work->handshake_data,
+	                  NULL,
+	                  true);
+	
+	if (debug_enabled) {
+		k_mutex_lock(&uart_mutex, K_FOREVER);
+		printk("  [Peer] Added %s from %s\n", hs_name, 
+		       hs_work->nickname[0] ? hs_work->nickname : "?");
+		k_mutex_unlock(&uart_mutex);
+	}
+	
+	/* Get or create Noise session */
+	struct noise_session *session = get_session(conn);
+	int conn_idx = get_conn_index(conn);
+	
+	/* === HANDLE NOISE INIT === */
+	if (hs_work->handshake_type == bitchat_TLV_NOISE_INIT && hs_work->handshake_len >= 32) {
+		
+		/* Initialize responder session if needed */
+		if (!session) {
+			if (init_session_for_conn(conn, false) == 0) {
+				session = get_session(conn);
+			}
+		}
+		
+		/* Process message 1 (INIT) */
+		if (session && noise_handshake_read_message1(session, hs_work->handshake_data, 
+		                                             hs_work->handshake_len) == 0) {
+			
+			/* Generate message 2 (RESP) */
+			uint8_t msg2[NOISE_KEY_SIZE * 2 + 16];
+			size_t msg2_len;
+			
+			if (noise_handshake_write_message2(session, &local_identity, msg2, &msg2_len) == 0) {
+				/* Build TLV response: NICKNAME + CHANNEL + NOISE_RESP */
+				uint8_t tlv_payload[256];
+				uint8_t *tlv_ptr = tlv_payload;
+				
+				/* TLV: Nickname */
+				*tlv_ptr++ = bitchat_TLV_NICKNAME;
+				*tlv_ptr++ = strlen(local_identity.nickname);
+				memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
+				tlv_ptr += strlen(local_identity.nickname);
+				
+				/* TLV: Channel (use Nostr channel hash) */
+				*tlv_ptr++ = bitchat_TLV_CHANNEL;
+				*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
+				memcpy(tlv_ptr, current_channel_hash, 32);
+				tlv_ptr += 32;
+				
+				/* TLV: NOISE_RESP */
+				*tlv_ptr++ = bitchat_TLV_NOISE_RESP;
+				*tlv_ptr++ = msg2_len;
+				memcpy(tlv_ptr, msg2, msg2_len);
+				tlv_ptr += msg2_len;
+				
+				uint16_t total_len = tlv_ptr - tlv_payload;
+				
+				/* Send MESSAGE packet with TLV */
+				struct bitchat_packet pkt;
+				if (bitchat_create_packet(&pkt, bitchat_PKT_MESSAGE, 
+				                           bitchat_MAX_TTL, 
+				                           tlv_payload, total_len) == 0) {
+					if (conn_idx >= 0) {
+						bitchat_send_packet(conn, remote_handles[conn_idx], &pkt);
+						k_mutex_lock(&uart_mutex, K_FOREVER);
+						printk("[TX] Sent RESP (80 bytes)\n");
+						k_mutex_unlock(&uart_mutex);
+					}
+				}
+			}
+		}
+	}
+	/* === HANDLE NOISE RESP (80-byte full handshake) === */
+	else if (hs_work->handshake_type == bitchat_TLV_NOISE_RESP && hs_work->handshake_len >= 80) {
+		
+		/* Valid 80-byte RESP to our INIT */
+		if (session && session->state == NOISE_SENT_E) {
+			
+			/* Process message 2 (RESP) */
+			if (noise_handshake_read_message2(session, &local_identity, 
+			                                 hs_work->handshake_data, hs_work->handshake_len) == 0) {
+				
+				/* Generate message 3 (FINISH) */
+				uint8_t msg3[NOISE_KEY_SIZE];
+				size_t msg3_len;
+				
+				if (noise_handshake_write_message3(session, &local_identity, msg3, &msg3_len) == 0) {
+					/* Build TLV response: NICKNAME + CHANNEL + NOISE_FINISH */
+					uint8_t tlv_payload[256];
+					uint8_t *tlv_ptr = tlv_payload;
+					
+					/* TLV: Nickname */
+					*tlv_ptr++ = bitchat_TLV_NICKNAME;
+					*tlv_ptr++ = strlen(local_identity.nickname);
+					memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
+					tlv_ptr += strlen(local_identity.nickname);
+					
+					/* TLV: Channel (use Nostr channel hash) */
+					*tlv_ptr++ = bitchat_TLV_CHANNEL;
+					*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
+					memcpy(tlv_ptr, current_channel_hash, 32);
+					tlv_ptr += 32;
+					
+					/* TLV: NOISE_FINISH */
+					*tlv_ptr++ = bitchat_TLV_NOISE_FINISH;
+					*tlv_ptr++ = msg3_len;
+					memcpy(tlv_ptr, msg3, msg3_len);
+					tlv_ptr += msg3_len;
+					
+					uint16_t total_len = tlv_ptr - tlv_payload;
+					
+					/* Send MESSAGE packet with TLV */
+					struct bitchat_packet pkt;
+					if (bitchat_create_packet(&pkt, bitchat_PKT_MESSAGE,
+					                           bitchat_MAX_TTL,
+					                           tlv_payload, total_len) == 0) {
+						if (conn_idx >= 0) {
+							bitchat_send_packet(conn, remote_handles[conn_idx], &pkt);
+							k_mutex_lock(&uart_mutex, K_FOREVER);
+							printk("[TX] Sent FINISH - TRANSPORT MODE ACTIVE\n");
+							k_mutex_unlock(&uart_mutex);
+						}
+					}
+				}
+			}
+		}
+	}
+	/* === HANDLE 32-BYTE RESP (ephemeral-only handshake for Android compatibility) === */
+	else if (hs_work->handshake_type == bitchat_TLV_NOISE_RESP && hs_work->handshake_len == 32) {
+		
+		/* Complete ephemeral-only handshake with remote ephemeral key */
+		if (session && session->state == NOISE_SENT_E) {
+			if (noise_complete_ephemeral_handshake(session, hs_work->handshake_data) == 0) {
+				k_mutex_lock(&uart_mutex, K_FOREVER);
+				printk("[Handshake] Ephemeral-only complete - TRANSPORT MODE ACTIVE\n");
+				k_mutex_unlock(&uart_mutex);
+			} else {
+				k_mutex_lock(&uart_mutex, K_FOREVER);
+				printk("[Noise] Failed to complete ephemeral handshake\n");
+				k_mutex_unlock(&uart_mutex);
+			}
+		} else {
+			/* Not in SENT_E state - treat as collision (INIT) */
+			k_mutex_lock(&uart_mutex, K_FOREVER);
+			printk("[Noise] 32-byte RESP but not in SENT_E state - treating as collision\n");
+			k_mutex_unlock(&uart_mutex);
+			
+			/* Reinitialize as responder */
+			if (init_session_for_conn(conn, false) == 0) {
+				session = get_session(conn);
+			}
+			
+			/* Process as INIT */
+			if (session && noise_handshake_read_message1(session, hs_work->handshake_data, 
+			                                             hs_work->handshake_len) == 0) {
+				
+				uint8_t msg2[NOISE_KEY_SIZE * 2 + 16];
+				size_t msg2_len;
+				
+				if (noise_handshake_write_message2(session, &local_identity, msg2, &msg2_len) == 0) {
+					uint8_t tlv_payload[256];
+					uint8_t *tlv_ptr = tlv_payload;
+					
+					*tlv_ptr++ = bitchat_TLV_NICKNAME;
+					*tlv_ptr++ = strlen(local_identity.nickname);
+					memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
+					tlv_ptr += strlen(local_identity.nickname);
+					
+				/* TLV: Channel (use Nostr channel hash) */
+				*tlv_ptr++ = bitchat_TLV_CHANNEL;
+				*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
+				memcpy(tlv_ptr, current_channel_hash, 32);
+				tlv_ptr += 32;
+					
+					uint16_t total_len = tlv_ptr - tlv_payload;
+					
+					struct bitchat_packet pkt;
+					if (bitchat_create_packet(&pkt, bitchat_PKT_MESSAGE, 
+					                           bitchat_MAX_TTL, 
+					                           tlv_payload, total_len) == 0) {
+						if (conn_idx >= 0) {
+							bitchat_send_packet(conn, remote_handles[conn_idx], &pkt);
+							k_mutex_lock(&uart_mutex, K_FOREVER);
+							printk("[TX] Sent RESP (collision resolution)\n");
+							k_mutex_unlock(&uart_mutex);
+						}
+					}
+				}
+			}
+		}
+	}
+	/* === HANDLE NOISE FINISH === */
+	else if (hs_work->handshake_type == bitchat_TLV_NOISE_FINISH && hs_work->handshake_len >= 32) {
+		
+		/* Process message 3 (FINISH) */
+		if (session && noise_handshake_read_message3(session, hs_work->handshake_data, 
+		                                             hs_work->handshake_len) == 0) {
+			k_mutex_lock(&uart_mutex, K_FOREVER);
+			printk("[Handshake] TRANSPORT MODE ACTIVE\n");
+			k_mutex_unlock(&uart_mutex);
+		}
+	}
+}
+
 /* Work handler to send messages - runs in dedicated BLE work queue (for safe GATT writes) */
 static void send_message_work_handler(struct k_work *work)
 {
@@ -2233,11 +2217,11 @@ static void send_message_work_handler(struct k_work *work)
 		memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
 		tlv_ptr += strlen(local_identity.nickname);
 		
-		/* Add channel TLV */
-		*tlv_ptr++ = bitchat_TLV_CHANNEL;
-		*tlv_ptr++ = strlen(current_channel);
-		memcpy(tlv_ptr, current_channel, strlen(current_channel));
-		tlv_ptr += strlen(current_channel);
+/* Add channel TLV (use Nostr channel hash) */
+	*tlv_ptr++ = bitchat_TLV_CHANNEL;
+	*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
+	memcpy(tlv_ptr, current_channel_hash, 32);
+	tlv_ptr += 32;
 		
 		/* Add text TLV */
 		*tlv_ptr++ = bitchat_TLV_TEXT;
@@ -2301,11 +2285,11 @@ static void send_identity_broadcast_work_handler(struct k_work *work)
 	memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
 	tlv_ptr += strlen(local_identity.nickname);
 	
-	/* Add channel name */
+	/* Add channel name (use Nostr channel hash) */
 	*tlv_ptr++ = bitchat_TLV_CHANNEL;
-	*tlv_ptr++ = strlen(current_channel);
-	memcpy(tlv_ptr, current_channel, strlen(current_channel));
-	tlv_ptr += strlen(current_channel);
+	*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
+	memcpy(tlv_ptr, current_channel_hash, 32);
+	tlv_ptr += 32;
 	
 	/* Add channel hash (TLV 0x02, 32 bytes) - identifies which channel */
 	*tlv_ptr++ = bitchat_TLV_NOISE_INIT;  /* Reusing type 0x02 for channel hash */
@@ -2379,10 +2363,11 @@ static void send_handshake_work_handler(struct k_work *work)
 		memcpy(tlv_ptr, local_identity.nickname, strlen(local_identity.nickname));
 		tlv_ptr += strlen(local_identity.nickname);
 		
-		*tlv_ptr++ = bitchat_TLV_CHANNEL;
-		*tlv_ptr++ = strlen(current_channel);
-		memcpy(tlv_ptr, current_channel, strlen(current_channel));
-		tlv_ptr += strlen(current_channel);
+/* TLV: Channel (use Nostr channel hash) */
+	*tlv_ptr++ = bitchat_TLV_CHANNEL;
+	*tlv_ptr++ = 32;  /* SHA256 hash is always 32 bytes */
+	memcpy(tlv_ptr, current_channel_hash, 32);
+	tlv_ptr += 32;
 		
 		*tlv_ptr++ = bitchat_TLV_NOISE_INIT;
 		*tlv_ptr++ = msg1_len;
@@ -3052,19 +3037,43 @@ static int cmd_list(const struct shell *sh, size_t argc, char **argv)
 		shell_print(sh, "  BT Address: %s", addr);
 		shell_print(sh, "  Status:     %s", 
 		           peer_cache[i].connected ? "CONNECTED" : "DISCONNECTED");
-		
-		uint64_t age_ms = k_uptime_get() - peer_cache[i].last_seen;
-		if (age_ms < 1000) {
-			shell_print(sh, "  Last seen:  %llu ms ago", (unsigned long long)age_ms);
-		} else {
-			shell_print(sh, "  Last seen:  %llu sec ago", (unsigned long long)(age_ms / 1000));
+	
+	/* Show connection info if connected */
+	if (peer_cache[i].connected) {
+		/* Find matching connection */
+		for (int j = 0; j < connection_count; j++) {
+			if (active_connections[j]) {
+				const bt_addr_le_t *conn_addr = bt_conn_get_dst(active_connections[j]);
+				if (bt_addr_le_cmp(&peer_cache[i].addr, conn_addr) == 0) {
+					shell_print(sh, "  Connection: [%d] Ready=%s MTU=%u Handle=0x%04x",
+					           j, 
+					           connection_ready[j] ? "YES" : "NO",
+					           connection_mtu[j],
+					           remote_handles[j]);
+					
+					/* Show Noise session state */
+					struct noise_session *session = get_session(active_connections[j]);
+					if (session) {
+						const char *state_str = "UNKNOWN";
+						switch (session->state) {
+							case NOISE_IDLE: state_str = "IDLE"; break;
+							case NOISE_INIT: state_str = "INIT"; break;
+							case NOISE_RESP: state_str = "RESP"; break;
+							case NOISE_TRANSPORT: state_str = "TRANSPORT"; break;
+						}
+						shell_print(sh, "  Noise:      %s", state_str);
+						
+						if (session->state != NOISE_TRANSPORT) {
+							shell_print(sh, "              (ephemeral key exchange in progress)");
+						}
+					} else {
+						shell_print(sh, "  Noise:      (no session)");
+					}
+					break;
+				}
+			}
 		}
-		
-		if (peer_cache[i].has_noise_pubkey) {
-			shell_print(sh, "  Noise Key (X25519):");
-			for (int j = 0; j < 32; j += 16) {
-				shell_print(sh, "    %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-				           peer_cache[i].noise_pubkey[j+0], peer_cache[i].noise_pubkey[j+1],
+	}
 				           peer_cache[i].noise_pubkey[j+2], peer_cache[i].noise_pubkey[j+3],
 				           peer_cache[i].noise_pubkey[j+4], peer_cache[i].noise_pubkey[j+5],
 				           peer_cache[i].noise_pubkey[j+6], peer_cache[i].noise_pubkey[j+7],
@@ -4073,6 +4082,12 @@ int main(void)
 	k_work_init(&debug_work_item.work, debug_dissect_work_handler);
 	k_work_init(&tx_debug_work_item.work, tx_debug_dissect_work_handler);
 	
+	/* Initialize packet processing work */
+	k_work_init(&packet_work_item.work, packet_process_work_handler);
+	
+	/* Initialize handshake processing work */
+	k_work_init(&handshake_work_item.work, handshake_process_work_handler);
+	
 	/* Generate ephemeral keypairs on boot (not persisted) */
 	printk("[Init] Generating ephemeral identity keys...\n");
 	char random_nick[8];
@@ -4082,6 +4097,11 @@ int main(void)
 		return -1;
 	}
 	printk("[Identity] Ready: %s\n", local_identity.nickname);
+	
+	/* Compute Nostr channel hash for "#bluetooth" */
+	uint8_t dummy_identity[32];  /* Not used, but derive_geohash_identity requires it */
+	derive_geohash_identity("#bluetooth", current_channel_hash, dummy_identity);
+	printk("[Channel] Using Nostr hash for #bluetooth\n");
 	
 	/* Initialize Bluetooth */
 	printk("[Init] Initializing Bluetooth LE...\n");
